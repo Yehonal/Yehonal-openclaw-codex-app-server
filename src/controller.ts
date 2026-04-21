@@ -1564,18 +1564,18 @@ export class CodexPluginController {
   }> {
     await this.start();
     return {
-      defaultEndpoint: "default",
+      defaultEndpoint: this.settings.defaultEndpoint,
       defaultWorkspaceDir: this.settings.defaultWorkspaceDir ?? null,
       defaultModel: this.settings.defaultModel ?? null,
-      endpoints: [{
-        id: "default",
-        transport: this.settings.transport,
-        url: this.settings.url ?? null,
-        command: this.settings.command,
-        args: [...this.settings.args],
-        requestTimeoutMs: this.settings.requestTimeoutMs,
-        supportsFullAccess: this.client.hasProfile("full-access"),
-      }],
+      endpoints: this.settings.endpoints.map((endpoint, index) => ({
+        id: endpoint.id ?? `endpoint-${index + 1}`,
+        transport: endpoint.transport,
+        url: endpoint.url ?? null,
+        command: endpoint.command,
+        args: [...endpoint.args],
+        requestTimeoutMs: endpoint.requestTimeoutMs,
+        supportsFullAccess: this.getClientForEndpoint(endpoint.id).hasProfile("full-access"),
+      })),
     };
   }
 
@@ -1594,8 +1594,8 @@ export class CodexPluginController {
     threads: Awaited<ReturnType<CodexAppServerModeClient["listThreads"]>>;
   }> {
     await this.start();
-    const endpointId = this.resolveStandaloneEndpointId(params.endpointId);
-    const permissionsMode = this.resolveAgentPermissionsMode(params.permissionsMode);
+    const endpointId = this.resolveAgentEndpointId(params.endpointId);
+    const permissionsMode = this.resolveAgentPermissionsMode(endpointId, params.permissionsMode);
     const workspaceDir = params.includeAllWorkspaces
       ? undefined
       : resolveWorkspaceDir({
@@ -1603,7 +1603,7 @@ export class CodexPluginController {
           configuredWorkspaceDir: this.settings.defaultWorkspaceDir,
           serviceWorkspaceDir: this.serviceWorkspaceDir,
         });
-    const threads = await this.client.listThreads({
+    const threads = await this.getClientForEndpoint(endpointId).listThreads({
       sessionKey: params.sessionKey,
       workspaceDir,
       filter: params.filter?.trim() || undefined,
@@ -1631,16 +1631,17 @@ export class CodexPluginController {
     context: Awaited<ReturnType<CodexAppServerModeClient["readThreadContext"]>>;
   }> {
     await this.start();
-    const endpointId = this.resolveStandaloneEndpointId(params.endpointId);
-    const permissionsMode = this.resolveAgentPermissionsMode(params.permissionsMode);
+    const endpointId = this.resolveAgentEndpointId(params.endpointId);
+    const permissionsMode = this.resolveAgentPermissionsMode(endpointId, params.permissionsMode);
     const threadId = params.threadId.trim();
+    const client = this.getClientForEndpoint(endpointId);
     const [state, context] = await Promise.all([
-      this.client.readThreadState({
+      client.readThreadState({
         sessionKey: params.sessionKey,
         threadId,
         profile: permissionsMode,
       }),
-      this.client.readThreadContext({
+      client.readThreadContext({
         sessionKey: params.sessionKey,
         threadId,
         profile: permissionsMode,
@@ -1681,20 +1682,21 @@ export class CodexPluginController {
     result: TurnResult;
   }> {
     await this.start();
-    const endpointId = this.resolveStandaloneEndpointId(params.endpointId);
-    const permissionsMode = this.resolveAgentPermissionsMode(params.permissionsMode);
+    const endpointId = this.resolveAgentEndpointId(params.endpointId);
+    const permissionsMode = this.resolveAgentPermissionsMode(endpointId, params.permissionsMode);
     const workspaceDir = resolveWorkspaceDir({
       requested: params.workspaceDir,
       configuredWorkspaceDir: this.settings.defaultWorkspaceDir,
       serviceWorkspaceDir: this.serviceWorkspaceDir,
     });
     const threadName = params.threadName?.trim() || "";
+    const client = this.getClientForEndpoint(endpointId);
     let threadId = params.threadId?.trim() || "";
     let reusedThreadByName = false;
     let createdThread = false;
 
     if (!threadId && params.reuseThreadByName && threadName) {
-      const matches = await this.client.listThreads({
+      const matches = await client.listThreads({
         sessionKey: params.sessionKey,
         workspaceDir,
         filter: threadName,
@@ -1710,7 +1712,7 @@ export class CodexPluginController {
     }
 
     if (!threadId && threadName) {
-      const created = await this.client.startThread({
+      const created = await client.startThread({
         sessionKey: params.sessionKey,
         workspaceDir,
         model: params.model?.trim() || this.settings.defaultModel,
@@ -1718,14 +1720,14 @@ export class CodexPluginController {
       });
       threadId = created.threadId;
       createdThread = true;
-      await this.client.setThreadName({
+      await client.setThreadName({
         sessionKey: params.sessionKey,
         threadId,
         name: threadName,
         profile: permissionsMode,
       });
       if (params.serviceTier?.trim()) {
-        await this.client.setThreadServiceTier({
+        await client.setThreadServiceTier({
           sessionKey: params.sessionKey,
           threadId,
           serviceTier: params.serviceTier.trim(),
@@ -1736,7 +1738,7 @@ export class CodexPluginController {
 
     let pendingInput: null | Pick<PendingInputState, "requestId" | "options" | "promptText" | "method"> = null;
     let activeRun: ActiveCodexRun | null = null;
-    activeRun = this.client.startTurn({
+    activeRun = client.startTurn({
       sessionKey: params.sessionKey,
       prompt: params.prompt,
       input: params.input,
@@ -1780,21 +1782,24 @@ export class CodexPluginController {
     };
   }
 
-  private resolveStandaloneEndpointId(endpointId?: string): string {
+  private resolveAgentEndpointId(endpointId?: string): string {
     const requested = endpointId?.trim();
     if (!requested) {
-      return "default";
+      return this.settings.defaultEndpoint;
     }
-    if (requested !== "default") {
-      throw new Error(`Single-endpoint configuration exposes only endpoint id 'default', got: ${requested}`);
+    if (!this.settings.endpoints.some((entry) => entry.id === requested)) {
+      throw new Error(`Unknown Codex endpoint: ${requested}`);
     }
     return requested;
   }
 
-  private resolveAgentPermissionsMode(requested?: PermissionsMode): PermissionsMode {
+  private resolveAgentPermissionsMode(
+    endpointId: string,
+    requested?: PermissionsMode,
+  ): PermissionsMode {
     const resolved = requested === "full-access" ? "full-access" : "default";
-    if (resolved === "full-access" && !this.client.hasProfile("full-access")) {
-      throw new Error("Configured Codex endpoint does not expose the full-access profile.");
+    if (resolved === "full-access" && !this.getClientForEndpoint(endpointId).hasProfile("full-access")) {
+      throw new Error(`Codex endpoint ${endpointId} does not expose the full-access profile.`);
     }
     return resolved;
   }
