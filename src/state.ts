@@ -10,7 +10,6 @@ import type {
   PermissionsMode,
   StoreSnapshot,
   StoredBinding,
-  StoredConversationEndpoint,
   StoredPendingBind,
   StoredPendingRequest,
 } from "./types.js";
@@ -19,7 +18,6 @@ type PutCallbackInput =
   | {
       kind: "start-new-thread";
       conversation: ConversationTarget;
-      endpointId?: string;
       workspaceDir: string;
       syncTopic?: boolean;
       requestedModel?: string;
@@ -31,7 +29,6 @@ type PutCallbackInput =
   | {
       kind: "resume-thread";
       conversation: ConversationTarget;
-      endpointId?: string;
       threadId: string;
       threadTitle?: string;
       workspaceDir: string;
@@ -255,7 +252,6 @@ function cloneSnapshot(value?: Partial<StoreSnapshot>): StoreSnapshot {
   return {
     version: STORE_VERSION,
     bindings: value?.bindings ?? [],
-    conversationEndpoints: value?.conversationEndpoints ?? [],
     pendingBinds: value?.pendingBinds ?? [],
     pendingRequests: value?.pendingRequests ?? [],
     callbacks: value?.callbacks ?? [],
@@ -315,7 +311,6 @@ function normalizeSnapshot(value?: Partial<StoreSnapshot>): StoreSnapshot {
       | undefined;
     return {
       ...binding,
-      endpointId: binding.endpointId?.trim() || "default",
       permissionsMode: inferPermissionsModeFromLegacyFields({
         permissionsMode: (binding as StoredBinding & { permissionsMode?: string }).permissionsMode,
         appServerProfile: (binding as StoredBinding & { appServerProfile?: string }).appServerProfile,
@@ -341,7 +336,6 @@ function normalizeSnapshot(value?: Partial<StoreSnapshot>): StoreSnapshot {
       | undefined;
     return {
       ...entry,
-      endpointId: entry.endpointId?.trim() || "default",
       permissionsMode: inferPermissionsModeFromLegacyFields({
         permissionsMode: (entry as StoredPendingBind & { permissionsMode?: string }).permissionsMode,
         appServerProfile: (entry as StoredPendingBind & { appServerProfile?: string }).appServerProfile,
@@ -351,16 +345,6 @@ function normalizeSnapshot(value?: Partial<StoreSnapshot>): StoreSnapshot {
       preferences: normalizeConversationPreferences(legacyPreferences),
     };
   });
-  snapshot.pendingRequests = snapshot.pendingRequests.map((entry) => ({
-    ...entry,
-    endpointId: entry.endpointId?.trim() || "default",
-  }));
-  snapshot.conversationEndpoints = snapshot.conversationEndpoints
-    .map((entry) => ({
-      ...entry,
-      endpointId: entry.endpointId?.trim() || "default",
-    }))
-    .filter((entry) => entry.endpointId);
   return snapshot;
 }
 
@@ -422,24 +406,6 @@ export class PluginStateStore {
   getBinding(target: ConversationTarget): StoredBinding | null {
     const key = toConversationKey(target);
     return this.snapshot.bindings.find((entry) => toConversationKey(entry.conversation) === key) ?? null;
-  }
-
-  getConversationEndpoint(target: ConversationTarget): StoredConversationEndpoint | null {
-    const key = toConversationKey(target);
-    return (
-      this.snapshot.conversationEndpoints.find(
-        (entry) => toConversationKey(entry.conversation as ConversationTarget) === key,
-      ) ?? null
-    );
-  }
-
-  async upsertConversationEndpoint(entry: StoredConversationEndpoint): Promise<void> {
-    const key = toConversationKey(entry.conversation as ConversationTarget);
-    this.snapshot.conversationEndpoints = this.snapshot.conversationEndpoints.filter(
-      (current) => toConversationKey(current.conversation as ConversationTarget) !== key,
-    );
-    this.snapshot.conversationEndpoints.push(entry);
-    await this.save();
   }
 
   async upsertBinding(binding: StoredBinding): Promise<void> {
@@ -539,7 +505,6 @@ export class PluginStateStore {
         ? {
             kind: "start-new-thread",
             conversation: callback.conversation,
-            endpointId: callback.endpointId,
             workspaceDir: callback.workspaceDir,
             syncTopic: callback.syncTopic,
             requestedModel: callback.requestedModel,
@@ -553,7 +518,6 @@ export class PluginStateStore {
         ? {
             kind: "resume-thread",
             conversation: callback.conversation,
-            endpointId: callback.endpointId,
             threadId: callback.threadId,
             threadTitle: callback.threadTitle,
             workspaceDir: callback.workspaceDir,
