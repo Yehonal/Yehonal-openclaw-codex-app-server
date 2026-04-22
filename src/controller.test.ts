@@ -214,7 +214,7 @@ function createApiMock(pluginConfigOverrides: Record<string, unknown> = {}) {
   };
 }
 
-async function createControllerHarness() {
+async function createControllerHarness(pluginConfigOverrides: Record<string, unknown> = {}) {
   const {
     api,
     sendComponentMessage,
@@ -226,7 +226,7 @@ async function createControllerHarness() {
     editChannel,
     discordOutbound,
     stateDir,
-  } = createApiMock();
+  } = createApiMock(pluginConfigOverrides);
   const controller = new CodexPluginController(api);
   await controller.start();
   const threadState: any = {
@@ -7284,5 +7284,67 @@ describe("Discord controller flows", () => {
     });
     // The callback should be removed from the store
     expect((controller as any).store.getCallback(callback.token)).toBeNull();
+  });
+
+  it("auto-selects the matching endpoint when exec host=node and node matches endpoint id", async () => {
+    const { controller } = await createControllerHarness({
+      defaultEndpoint: "default",
+      endpoints: [
+        {
+          id: "default",
+          transport: "websocket",
+          url: "ws://127.0.0.1:8765",
+        },
+        {
+          id: "nestdev",
+          transport: "websocket",
+          url: "ws://172.23.100.26:8765",
+        },
+      ],
+    });
+
+    expect((controller as any).resolveAgentEndpointId(undefined, { host: "node", node: "nestdev" })).toBe("nestdev");
+  });
+
+  it("auto-selects the matching endpoint when exec node matches an endpoint alias", async () => {
+    const { controller } = await createControllerHarness({
+      defaultEndpoint: "default",
+      endpoints: [
+        {
+          id: "default",
+          transport: "websocket",
+          url: "ws://127.0.0.1:8765",
+        },
+        {
+          id: "nestdev-cas",
+          execNodes: ["nestdev", "node-123"],
+          transport: "websocket",
+          url: "ws://172.23.100.26:8765",
+        },
+      ],
+    });
+
+    expect((controller as any).resolveAgentEndpointId(undefined, { host: "node", node: "node-123" })).toBe("nestdev-cas");
+  });
+
+  it("keeps the configured default endpoint when exec host is not node", async () => {
+    const { controller } = await createControllerHarness({
+      defaultEndpoint: "default",
+      endpoints: [
+        {
+          id: "default",
+          transport: "websocket",
+          url: "ws://127.0.0.1:8765",
+        },
+        {
+          id: "nestdev",
+          execNodes: ["nestdev"],
+          transport: "websocket",
+          url: "ws://172.23.100.26:8765",
+        },
+      ],
+    });
+
+    expect((controller as any).resolveAgentEndpointId(undefined, { host: "gateway", node: "nestdev" })).toBe("default");
   });
 });
