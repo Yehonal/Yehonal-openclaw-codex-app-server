@@ -90,7 +90,7 @@ export function createAgentTools(controller: CodexPluginController) {
       name: "codex_workers_list_threads",
       description: "List Codex threads on a worker endpoint. Use this before reusing an existing thread.",
       parameters: Type.Object({
-        endpointId: Type.Optional(Type.String({ description: "Configured worker endpoint id, such as nestdev or windows-main." })),
+        endpointId: Type.Optional(Type.String({ description: "Configured worker endpoint id. In single-endpoint mode this is usually `default`." })),
         workspaceDir: Type.Optional(Type.String({ description: "Workspace/project directory on the remote worker. Omit to use the endpoint default." })),
         includeAllWorkspaces: Type.Optional(Type.Boolean({ description: "When true, do not scope thread discovery to a workspace directory." })),
         filter: Type.Optional(Type.String({ description: "Optional search string for thread discovery." })),
@@ -128,7 +128,7 @@ export function createAgentTools(controller: CodexPluginController) {
       name: "codex_workers_run_task",
       description: "Run a prompt on a Codex worker via app-server, optionally continuing or naming a persistent thread.",
       parameters: Type.Object({
-        endpointId: Type.Optional(Type.String({ description: "Configured worker endpoint id, such as nestdev or windows-main." })),
+        endpointId: Type.Optional(Type.String({ description: "Configured worker endpoint id. In single-endpoint mode this is usually `default`." })),
         prompt: Type.String({ description: "Prompt to send to the remote Codex worker." }),
         workspaceDir: Type.Optional(Type.String({ description: "Workspace/project directory on the remote worker. Omit to use the endpoint default." })),
         threadId: Type.Optional(Type.String({ description: "Existing Codex thread id to continue." })),
@@ -218,7 +218,7 @@ export function createAgentTools(controller: CodexPluginController) {
       name: "codex_workers_read_thread_context",
       description: "Read the current state and replay summary for a Codex worker thread.",
       parameters: Type.Object({
-        endpointId: Type.Optional(Type.String({ description: "Configured worker endpoint id, such as nestdev or windows-main." })),
+        endpointId: Type.Optional(Type.String({ description: "Configured worker endpoint id. In single-endpoint mode this is usually `default`." })),
         threadId: Type.String({ description: "Codex thread id to inspect." }),
         permissionsMode: Type.Optional(Type.Union([
           Type.Literal("default"),

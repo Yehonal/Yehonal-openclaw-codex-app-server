@@ -119,10 +119,10 @@ Pre-release packages are published on matching npm dist-tags instead of `latest`
 
 This plugin can also expose **agent-callable tools** so OpenClaw can talk to Codex workers **without manual `/cas_*` control**.
 
-Use this mode when you want OpenClaw to act as an orchestrator over multiple Codex app-server endpoints, for example:
+Use this mode when you want OpenClaw to act as an orchestrator over Codex workers, for example:
 
-- `windows-main` as a browser/context worker
-- `nestdev` as a development worker
+- a context-heavy worker
+- an implementation worker
 
 Current tool surface:
 
@@ -141,8 +141,8 @@ Notes:
 Suggested pattern:
 
 1. `codex_workers_describe_endpoints`
-2. `codex_workers_run_task(endpointId="windows-main", ...)`
-3. `codex_workers_run_task(endpointId="nestdev", threadName="job/...", ...)`
+2. `codex_workers_run_task(endpointId="default", ...)`
+3. `codex_workers_run_task(threadName="job/implementation-worker", reuseThreadByName=true, ...)`
 4. `codex_workers_read_thread_context(...)` when you need replay/state
 
 The manual `/cas_*` commands still remain useful as the human-facing fallback and debugging surface.

@@ -8,8 +8,8 @@ Allow OpenClaw to orchestrate one or more Codex workers **directly via Codex app
 
 This is intended for flows like:
 
-- `windows-main` -> browser / Jira / Teams / email / authenticated context worker
-- `nestdev` -> repo implementation worker
+- a context worker
+- an implementation worker
 - OpenClaw -> planner / router / memory / reporting layer
 
 ## Why direct app-server instead of MCP here?
@@ -115,8 +115,8 @@ This avoids deadlocks.
 
 Use these tools directly from OpenClaw:
 
-1. gather context on `windows-main`
-2. pass the structured result to `nestdev`
+1. gather context on the currently configured worker
+2. continue the same thread or hand the structured result to another worker at the OpenClaw routing layer
 3. continue the same named thread when useful
 4. inspect thread context if a run needs to be resumed later
 

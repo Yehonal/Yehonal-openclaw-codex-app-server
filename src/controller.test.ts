@@ -4271,7 +4271,7 @@ describe("Discord controller flows", () => {
         accountId: "default",
         conversationId: "channel:1481858418548412579",
       },
-      endpointId: "windows-main",
+      endpointId: "default",
       updatedAt: Date.now(),
     });
     conversationRuntimeState.getCurrentPluginConversationBinding.mockImplementation(async () => ({
@@ -4320,7 +4320,7 @@ describe("Discord controller flows", () => {
       conversationId: "channel:1481858418548412579",
     })).toEqual(expect.objectContaining({
       threadId: "019dab3f-09f7-7a42-8d10-1f2949ce6f30",
-      endpointId: "windows-main",
+      endpointId: "default",
       workspaceDir: "/repo/openclaw",
       permissionsMode: "full-access",
     }));
