@@ -8,8 +8,8 @@ Allow OpenClaw to orchestrate one or more Codex workers **directly via Codex app
 
 This is intended for flows like:
 
-- a context worker
-- an implementation worker
+- `context-worker` -> browser or authenticated context worker
+- `implementation-worker` -> repo implementation worker
 - OpenClaw -> planner / router / memory / reporting layer
 
 ## Why direct app-server instead of MCP here?
@@ -115,8 +115,8 @@ This avoids deadlocks.
 
 Use these tools directly from OpenClaw:
 
-1. gather context on the currently configured worker
-2. continue the same thread or hand the structured result to another worker at the OpenClaw routing layer
+1. gather context on `context-worker`
+2. pass the structured result to `implementation-worker`
 3. continue the same named thread when useful
 4. inspect thread context if a run needs to be resumed later
 
