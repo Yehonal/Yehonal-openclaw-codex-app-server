@@ -583,6 +583,15 @@ export type CallbackAction =
     }
   | {
       token: string;
+      kind: "clear-endpoint";
+      conversation: ConversationRef;
+      returnToStatus?: boolean;
+      statusMessage?: InteractiveMessageRef;
+      createdAt: number;
+      expiresAt: number;
+    }
+  | {
+      token: string;
       kind: "reply-text";
       conversation: ConversationRef;
       text: string;
