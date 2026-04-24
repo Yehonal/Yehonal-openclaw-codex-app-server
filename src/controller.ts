@@ -6245,13 +6245,25 @@ export class CodexPluginController {
   private getOpenClawCompatCandidatePaths(fallbackRelativePath: string): string[] {
     const candidates: string[] = [];
     const seen = new Set<string>();
+    const pluginNodeModulesRoot = path.resolve(
+      path.dirname(fileURLToPath(import.meta.url)),
+      "..",
+      "node_modules",
+    );
     const pushCandidate = (baseEntrypointPath: string | undefined) => {
       const trimmed = baseEntrypointPath?.trim();
       if (!trimmed) {
         return;
       }
       const resolved = resolveCompatFallbackPath(trimmed, fallbackRelativePath);
-      if (!existsSync(resolved) || seen.has(resolved)) {
+      if (
+        !existsSync(resolved) ||
+        seen.has(resolved) ||
+        resolved.startsWith(`${pluginNodeModulesRoot}${path.sep}`)
+      ) {
+        if (resolved.startsWith(`${pluginNodeModulesRoot}${path.sep}`)) {
+          this.api.logger.info(`codex openclaw compat candidate skipped bundled path=${resolved}`);
+        }
         return;
       }
       seen.add(resolved);
