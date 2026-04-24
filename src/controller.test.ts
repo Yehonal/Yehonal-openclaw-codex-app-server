@@ -4,7 +4,7 @@ import path from "node:path";
 import { createRequire } from "node:module";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { OpenClawPluginApi, PluginCommandContext, ReplyPayload } from "openclaw/plugin-sdk";
-import { CodexAppServerClient } from "./client.js";
+import { CodexAppServerClient, CodexAppServerModeClient } from "./client.js";
 import { CodexPluginController } from "./controller.js";
 
 const TEST_TELEGRAM_PEER_ID = "telegram-user-1";
@@ -753,6 +753,120 @@ describe("Discord controller flows", () => {
         }),
       }),
     );
+  });
+
+  it("packs oversized Discord picker rows to stay within component limits", async () => {
+    const { api } = createApiMock();
+    const controller = new CodexPluginController(api);
+    await controller.start();
+
+    const spec = (controller as any).buildDiscordPickerSpec({
+      text: "Picker",
+      buttons: [
+        [{ text: "Thread 1", callback_data: "cb-1" }],
+        [{ text: "Thread 2", callback_data: "cb-2" }],
+        [{ text: "Thread 3", callback_data: "cb-3" }],
+        [{ text: "Thread 4", callback_data: "cb-4" }],
+        [{ text: "Thread 5", callback_data: "cb-5" }],
+        [{ text: "Thread 6", callback_data: "cb-6" }],
+        [{ text: "Thread 7", callback_data: "cb-7" }],
+        [{ text: "Thread 8", callback_data: "cb-8" }],
+        [
+          { text: "◀ Prev", callback_data: "cb-prev" },
+          { text: "Next ▶", callback_data: "cb-next" },
+        ],
+        [
+          { text: "Projects", callback_data: "cb-projects" },
+          { text: "Recent Threads", callback_data: "cb-recent" },
+        ],
+        [{ text: "Cancel", callback_data: "cb-cancel" }],
+      ],
+    });
+
+    expect(spec.blocks).toHaveLength(5);
+    expect(spec.blocks.slice(0, 2).map((block: { buttons: Array<unknown> }) => block.buttons.length)).toEqual([4, 4]);
+    expect(spec.blocks[2]?.buttons).toHaveLength(2);
+    expect(spec.blocks[3]?.buttons).toHaveLength(2);
+    expect(spec.blocks[4]?.buttons).toHaveLength(1);
+  });
+
+  it("falls back to the Discord runtime api when the outbound component adapter throws", async () => {
+    const { api } = createApiMock();
+    delete (api as any).runtime.channel.discord.sendComponentMessage;
+    const controller = new CodexPluginController(api);
+    await controller.start();
+    const sendDiscordComponentMessage = vi.fn(async () => ({
+      messageId: "discord-component-1",
+      channelId: "channel:chan-1",
+    }));
+
+    vi.spyOn(controller as any, "loadDiscordOutboundAdapter").mockResolvedValue({
+      sendPayload: vi.fn(async () => {
+        throw new Error("adapter boom");
+      }),
+    });
+    vi.spyOn(controller as any, "loadDiscordRuntimeApi").mockResolvedValue({
+      sendDiscordComponentMessage,
+    });
+
+    await expect(
+      (controller as any).sendDiscordPicker(
+        {
+          channel: "discord",
+          accountId: "default",
+          conversationId: "channel:chan-1",
+        },
+        {
+          text: "Picker",
+          buttons: [[{ text: "Thread 1", callback_data: "cb-1" }]],
+        },
+      ),
+    ).resolves.toBeUndefined();
+
+    expect(sendDiscordComponentMessage).toHaveBeenCalledWith(
+      "channel:chan-1",
+      expect.objectContaining({
+        text: "Picker",
+        blocks: expect.any(Array),
+      }),
+      expect.objectContaining({
+        accountId: "default",
+      }),
+    );
+  });
+
+  it("falls back to plain text when sending the resume picker directly fails", async () => {
+    const { api } = createApiMock();
+    const controller = new CodexPluginController(api);
+    await controller.start();
+
+    vi.spyOn(controller as any, "renderThreadPicker").mockResolvedValue({
+      text: "Showing recent Codex threads across all projects. Page 1/7.",
+      buttons: [
+        [{ text: "Thread 1", callback_data: "cb-1" }],
+        [{ text: "Thread 2", callback_data: "cb-2" }],
+        [{ text: "Thread 3", callback_data: "cb-3" }],
+        [{ text: "Thread 4", callback_data: "cb-4" }],
+        [{ text: "Thread 5", callback_data: "cb-5" }],
+        [{ text: "Thread 6", callback_data: "cb-6" }],
+      ],
+    });
+    vi.spyOn(controller as any, "sendDiscordPicker").mockRejectedValue(new Error("component transport unavailable"));
+
+    const reply = await (controller as any).handleListCommand(
+      {
+        channel: "discord",
+        accountId: "default",
+        conversationId: "channel:chan-1",
+      },
+      null,
+      "auto-node-nestdev",
+      "",
+      "discord",
+    );
+
+    expect(reply.text).toContain("Showing recent Codex threads across all projects.");
+    expect((reply as any).channelData?.discord?.components).toBeUndefined();
   });
 
   it("sends resume pickers through the Discord runtime api when adapter and legacy runtime are absent", async () => {
@@ -7380,6 +7494,381 @@ describe("Discord controller flows", () => {
     expect(deriveSpy).toHaveBeenCalledWith({ host: "node", node: "nestdev" });
   });
 
+  it("resolves node remoteIp from gateway node.list when creating an auto node endpoint", async () => {
+    const { controller, api } = await createControllerHarness({
+      defaultEndpoint: "default",
+      endpoints: [
+        {
+          id: "default",
+          transport: "websocket",
+          url: "ws://127.0.0.1:8765",
+        },
+      ],
+    });
+
+    const runCommandWithTimeout = vi.fn(async () => ({
+      stdout: JSON.stringify({
+        nodes: [
+          {
+            nodeId: "eff5affa748509b267ca1093449509ba0dfc30b2c0f25b57d675303cfd7520b1",
+            displayName: "nestdev",
+            remoteIp: "172.23.100.26",
+            paired: true,
+            connected: true,
+          },
+        ],
+      }),
+      stderr: "",
+      code: 0,
+      signal: null,
+      killed: false,
+      termination: "exit" as const,
+    }));
+    (api as any).runtime.system = { runCommandWithTimeout };
+
+    vi.spyOn(CodexAppServerModeClient.prototype, "readAccount").mockResolvedValue({} as any);
+    vi.spyOn(CodexAppServerModeClient.prototype, "close").mockResolvedValue();
+
+    const endpointId = await (controller as any).tryRegisterNodeDerivedEndpoint({
+      host: "node",
+      node: "nestdev",
+    });
+
+    expect(endpointId).toBe("auto-node-nestdev");
+    expect(runCommandWithTimeout).toHaveBeenCalled();
+    const derivedEndpoint = (controller as any).settings.endpoints.find((entry: { id?: string }) => entry.id === endpointId);
+    expect(derivedEndpoint?.url).toBe("ws://172.23.100.26:8765");
+    expect(derivedEndpoint?.execNodes ?? []).toEqual(
+      expect.arrayContaining([
+        "nestdev",
+        "eff5affa748509b267ca1093449509ba0dfc30b2c0f25b57d675303cfd7520b1",
+        "172.23.100.26",
+      ]),
+    );
+  });
+
+  it("passes node-fallback endpoint selection into /cas_resume", async () => {
+    const { controller } = await createControllerHarness();
+    vi
+      .spyOn(controller as any, "getSelectedEndpointResolutionWithNodeFallback")
+      .mockResolvedValue({
+        endpointId: "auto-node-nestdev",
+        source: "auto-node",
+        nodeId: "nestdev",
+      });
+    const joinSpy = vi.spyOn(controller as any, "handleJoinCommand").mockResolvedValue({ text: "Joined." });
+
+    const reply = await controller.handleCommand("cas_resume", buildDiscordCommandContext());
+
+    expect(joinSpy).toHaveBeenCalled();
+    const latestCall = joinSpy.mock.calls[joinSpy.mock.calls.length - 1];
+    expect(latestCall?.[7]).toBe("auto-node-nestdev");
+    expect(reply.text).toContain("Joined.");
+    expect(reply.text).toContain("Resolved endpoint: auto-node-nestdev (auto from node: nestdev)");
+  });
+
+  it("persists exec defaults for /exec_nestdev_itermodus on the current conversation session", async () => {
+    const { api } = createApiMock();
+    const controller = new CodexPluginController(api);
+    const runCommandWithTimeout = vi.fn(async (command: string[]) => {
+      if (command[3] === "sessions.list") {
+        return {
+          stdout: JSON.stringify({
+            sessions: [
+              {
+                key: "agent:main:discord:channel:chan-1",
+                deliveryContext: {
+                  channel: "discord",
+                  to: "channel:chan-1",
+                  accountId: "default",
+                },
+              },
+            ],
+          }),
+          stderr: "",
+          code: 0,
+          signal: null,
+          killed: false,
+          termination: "exit" as const,
+        };
+      }
+      if (command[3] === "sessions.patch") {
+        return {
+          stdout: JSON.stringify({ ok: true }),
+          stderr: "",
+          code: 0,
+          signal: null,
+          killed: false,
+          termination: "exit" as const,
+        };
+      }
+      throw new Error(`unexpected command: ${command.join(" ")}`);
+    });
+    (api as any).runtime.system = { runCommandWithTimeout };
+
+    const reply = await controller.handleCommand(
+      "exec_nestdev_itermodus",
+      buildDiscordCommandContext({
+        commandBody: "/exec_nestdev_itermodus",
+      }),
+    );
+
+    expect(runCommandWithTimeout).toHaveBeenCalledTimes(2);
+    expect(runCommandWithTimeout).toHaveBeenNthCalledWith(
+      1,
+      [
+        "openclaw",
+        "gateway",
+        "call",
+        "sessions.list",
+        "--params",
+        JSON.stringify({ limit: 500 }),
+        "--json",
+      ],
+      { timeoutMs: 10_000 },
+    );
+    expect(runCommandWithTimeout).toHaveBeenNthCalledWith(
+      2,
+      [
+        "openclaw",
+        "gateway",
+        "call",
+        "sessions.patch",
+        "--params",
+        JSON.stringify({
+          key: "agent:main:discord:channel:chan-1",
+          execHost: "node",
+          execSecurity: "full",
+          execAsk: "off",
+          execNode: "nestdev",
+        }),
+        "--json",
+      ],
+      { timeoutMs: 10_000 },
+    );
+    expect(reply.text).toContain("Exec defaults updated for this conversation.");
+    expect(reply.text).toContain("Session: agent:main:discord:channel:chan-1");
+    expect(reply.text).toContain("Now run /cas_resume.");
+  });
+
+  it("derives the conversation session key when no persisted session exists yet", async () => {
+    const { api } = createApiMock();
+    const controller = new CodexPluginController(api);
+    const runCommandWithTimeout = vi.fn(async (command: string[]) => {
+      if (command[3] === "sessions.list") {
+        return {
+          stdout: JSON.stringify({ sessions: [] }),
+          stderr: "",
+          code: 0,
+          signal: null,
+          killed: false,
+          termination: "exit" as const,
+        };
+      }
+      if (command[3] === "sessions.patch") {
+        return {
+          stdout: JSON.stringify({ ok: true }),
+          stderr: "",
+          code: 0,
+          signal: null,
+          killed: false,
+          termination: "exit" as const,
+        };
+      }
+      throw new Error(`unexpected command: ${command.join(" ")}`);
+    });
+    (api as any).runtime.system = { runCommandWithTimeout };
+
+    const reply = await controller.handleCommand(
+      "exec_nestdev_itermodus",
+      buildDiscordCommandContext({
+        commandBody: "/exec_nestdev_itermodus",
+        from: "discord:channel:1496931475470155987",
+      }),
+    );
+
+    expect(runCommandWithTimeout).toHaveBeenNthCalledWith(
+      2,
+      [
+        "openclaw",
+        "gateway",
+        "call",
+        "sessions.patch",
+        "--params",
+        JSON.stringify({
+          key: "agent:main:discord:channel:1496931475470155987",
+          execHost: "node",
+          execSecurity: "full",
+          execAsk: "off",
+          execNode: "nestdev",
+        }),
+        "--json",
+      ],
+      { timeoutMs: 10_000 },
+    );
+    expect(reply.text).toContain("Session: agent:main:discord:channel:1496931475470155987");
+  });
+
+  it("uses exec defaults persisted on the conversation session for /cas_resume", async () => {
+    const { api } = createApiMock({
+      defaultEndpoint: "default",
+      endpoints: [
+        {
+          id: "default",
+          transport: "websocket",
+          url: "ws://127.0.0.1:8765",
+        },
+      ],
+    });
+    const controller = new CodexPluginController(api);
+    vi
+      .spyOn(controller as any, "resolveConversationSessionKey")
+      .mockResolvedValue("agent:main:discord:channel:chan-1");
+    vi
+      .spyOn(controller as any, "readExecContextFromSessionKey")
+      .mockResolvedValue({ host: "node", node: "nestdev" });
+    vi
+      .spyOn(controller as any, "tryRegisterNodeDerivedEndpoint")
+      .mockResolvedValue("auto-node-nestdev");
+
+    await expect(
+      (controller as any).getSelectedEndpointResolutionWithNodeFallback(
+        {
+          channel: "discord",
+          accountId: "default",
+          conversationId: "channel:chan-1",
+        },
+        null,
+      ),
+    ).resolves.toEqual({
+      endpointId: "auto-node-nestdev",
+      source: "auto-node",
+      nodeId: "nestdev",
+    });
+  });
+
+  it("resolves node remoteIp from the local paired node registry without gateway node.list", async () => {
+    const homeDir = fs.mkdtempSync(path.join(os.tmpdir(), "openclaw-home-"));
+    fs.mkdirSync(path.join(homeDir, ".openclaw", "nodes"), { recursive: true });
+    fs.writeFileSync(
+      path.join(homeDir, ".openclaw", "nodes", "paired.json"),
+      JSON.stringify({
+        eff5affa748509b267ca1093449509ba0dfc30b2c0f25b57d675303cfd7520b1: {
+          nodeId: "eff5affa748509b267ca1093449509ba0dfc30b2c0f25b57d675303cfd7520b1",
+          displayName: "nestdev",
+          remoteIp: "172.23.100.26",
+          lastConnectedAtMs: Date.now(),
+        },
+      }),
+      "utf-8",
+    );
+    const previousHome = process.env.HOME;
+    process.env.HOME = homeDir;
+    try {
+      const harness = createApiMock({
+        defaultEndpoint: "default",
+        endpoints: [
+          {
+            id: "default",
+            transport: "websocket",
+            url: "ws://127.0.0.1:8765",
+          },
+        ],
+      });
+      const controller = new CodexPluginController(harness.api);
+      await controller.start();
+
+      const endpointId = await (controller as any).tryRegisterNodeDerivedEndpoint({
+        host: "node",
+        node: "nestdev",
+      });
+
+      expect(endpointId).toBe("auto-node-nestdev");
+      const derivedEndpoint = (controller as any).settings.endpoints.find((entry: { id?: string }) => entry.id === endpointId);
+      expect(derivedEndpoint?.url).toBe("ws://172.23.100.26:8765");
+      expect(derivedEndpoint?.execNodes ?? []).toEqual(
+        expect.arrayContaining([
+          "nestdev",
+          "eff5affa748509b267ca1093449509ba0dfc30b2c0f25b57d675303cfd7520b1",
+          "172.23.100.26",
+        ]),
+      );
+    } finally {
+      if (previousHome === undefined) {
+        delete process.env.HOME;
+      } else {
+        process.env.HOME = previousHome;
+      }
+    }
+  });
+
+  it("prefers the bound endpoint over global exec config for /cas_resume", async () => {
+    const { controller } = await createControllerHarness({
+      defaultEndpoint: "default",
+      endpoints: [
+        {
+          id: "default",
+          transport: "websocket",
+          url: "ws://127.0.0.1:8765",
+        },
+        {
+          id: "auto-node-nestdev",
+          execNodes: ["nestdev"],
+          transport: "websocket",
+          url: "ws://172.23.100.26:8765",
+        },
+      ],
+    });
+    const joinSpy = vi.spyOn(controller as any, "handleJoinCommand").mockResolvedValue({ text: "Joined." });
+
+    const reply = await controller.handleCommand(
+      "cas_resume",
+      buildDiscordCommandContext({
+        config: {
+          tools: {
+            exec: {
+              host: "gateway",
+            },
+          },
+        },
+        getCurrentConversationBinding: vi.fn(async () => ({ bindingId: "b1" })),
+      }),
+    );
+
+    await (controller as any).bindConversation(
+      {
+        channel: "discord",
+        accountId: "default",
+        conversationId: "channel:chan-1",
+      },
+      {
+        threadId: "thread-1",
+        endpointId: "auto-node-nestdev",
+        workspaceDir: "/tmp/project",
+      },
+    );
+
+    const reboundReply = await controller.handleCommand(
+      "cas_resume",
+      buildDiscordCommandContext({
+        config: {
+          tools: {
+            exec: {
+              host: "gateway",
+            },
+          },
+        },
+        getCurrentConversationBinding: vi.fn(async () => ({ bindingId: "b1" })),
+      }),
+    );
+
+    expect(joinSpy).toHaveBeenCalled();
+    const latestCall = joinSpy.mock.calls[joinSpy.mock.calls.length - 1];
+    expect(latestCall?.[7]).toBe("auto-node-nestdev");
+    expect(reboundReply.text).toContain("Resolved endpoint: auto-node-nestdev (bound conversation)");
+    expect(reply.text).toContain("Resolved endpoint: default (default)");
+  });
+
   it("falls back to default endpoint when node-derived probe is unavailable", async () => {
     const { controller } = await createControllerHarness({
       defaultEndpoint: "default",
@@ -7470,6 +7959,54 @@ describe("Discord controller flows", () => {
         conversationId: "channel:chan-1",
       }),
     ).toMatchObject({ endpointId: "default", source: "manual" });
+  });
+
+  it("prefers the bound endpoint before falling back to runtime exec config", async () => {
+    const { controller } = await createControllerHarness({
+      defaultEndpoint: "default",
+      endpoints: [
+        {
+          id: "default",
+          transport: "websocket",
+          url: "ws://127.0.0.1:8765",
+        },
+        {
+          id: "auto-node-nestdev",
+          execNodes: ["nestdev"],
+          transport: "websocket",
+          url: "ws://172.23.100.26:8765",
+        },
+      ],
+    });
+    (controller as any).lastRuntimeConfig = {
+      tools: {
+        exec: {
+          host: "gateway",
+        },
+      },
+    };
+
+    expect(
+      (controller as any).getSelectedEndpointResolution(
+        {
+          channel: "discord",
+          accountId: "default",
+          conversationId: "channel:chan-1",
+        },
+        {
+          conversation: {
+            channel: "discord",
+            accountId: "default",
+            conversationId: "channel:chan-1",
+          },
+          sessionKey: "codex:thread-1",
+          threadId: "thread-1",
+          endpointId: "auto-node-nestdev",
+          workspaceDir: "/tmp/project",
+          updatedAt: Date.now(),
+        },
+      ),
+    ).toMatchObject({ endpointId: "auto-node-nestdev", source: "bound" });
   });
 
   it("clears the manual endpoint override and falls back to automatic node resolution", async () => {

@@ -151,6 +151,7 @@ The manual `/cas_*` commands still remain useful as the human-facing fallback an
 
 | Command | What it does | Notes / examples |
 | --- | --- | --- |
+| `/exec_nestdev_itermodus` | Persist `exec` defaults for the current conversation on `node=nestdev`. | Writes `host=node`, `security=full`, `ask=off`, `node=nestdev` into the conversation session, then you can run `/cas_resume`. |
 | `/cas_resume` | Bind this conversation to a Codex thread. | With no args, opens a picker for recent threads in the current workspace and includes a `New` button. |
 | `/cas_resume --projects` | Browse projects first. | Opens a project picker, then a thread picker. |
 | `/cas_resume --new` | Start a fresh Codex thread in a project. | Opens a project picker instead of a thread picker. |

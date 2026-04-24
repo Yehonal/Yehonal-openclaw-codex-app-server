@@ -8,6 +8,9 @@ importers:
 
   .:
     dependencies:
+      '@sinclair/typebox':
+        specifier: ^0.34.41
+        version: 0.34.49
       openclaw:
         specifier: '>=2026.3.22'
         version: 2026.4.1(@napi-rs/canvas@0.1.96)

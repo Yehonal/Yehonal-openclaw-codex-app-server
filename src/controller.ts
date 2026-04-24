@@ -1319,6 +1319,36 @@ function truncateDiscordLabel(text: string, maxChars = 80): string {
   return `${trimmed.slice(0, Math.max(1, maxChars - 1)).trimEnd()}…`;
 }
 
+function packDiscordPickerRows(rows: PluginInteractiveButtons | undefined): PluginInteractiveButtons {
+  const inputRows = rows ?? [];
+  if (inputRows.length <= 5) {
+    return inputRows;
+  }
+
+  let optionRowCount = 0;
+  while (optionRowCount < inputRows.length && inputRows[optionRowCount]?.length === 1) {
+    optionRowCount += 1;
+  }
+  if (optionRowCount === 0) {
+    return inputRows;
+  }
+
+  const optionRows = inputRows.slice(0, optionRowCount);
+  const trailingRows = inputRows.slice(optionRowCount);
+  const availableOptionRows = Math.max(1, 5 - trailingRows.length);
+  if (optionRows.length <= availableOptionRows) {
+    return inputRows;
+  }
+
+  const optionButtons = optionRows.flatMap((row) => row);
+  const chunkSize = Math.min(5, Math.max(1, Math.ceil(optionButtons.length / availableOptionRows)));
+  const packedOptionRows: PluginInteractiveButtons = [];
+  for (let index = 0; index < optionButtons.length; index += chunkSize) {
+    packedOptionRows.push(optionButtons.slice(index, index + chunkSize));
+  }
+  return [...packedOptionRows, ...trailingRows];
+}
+
 type WorkspaceChoice = {
   workspaceDir: string;
   threadCount: number;
@@ -1332,8 +1362,26 @@ type AgentExecContext = {
 
 type EndpointResolution = {
   endpointId: string;
-  source: "manual" | "auto-node" | "default";
+  source: "manual" | "bound" | "auto-node" | "default";
   nodeId?: string;
+};
+
+type GatewayNodeSummary = {
+  nodeId?: string;
+  displayName?: string;
+  remoteIp?: string;
+  paired?: boolean;
+  connected?: boolean;
+};
+
+type GatewaySessionSummary = {
+  key?: string;
+  deliveryContext?: {
+    channel?: string;
+    to?: string;
+    accountId?: string;
+    threadId?: string | number;
+  };
 };
 
 function listWorkspaceChoices(
@@ -1731,48 +1779,58 @@ export class CodexPluginController {
     if (host !== "node" || !node) {
       return undefined;
     }
-    const normalizedNode = node.toLowerCase();
-    const existingAliasMatch = this.settings.endpoints.find((entry) =>
-      (entry.execNodes ?? []).some((alias) => alias.trim().toLowerCase() === normalizedNode),
-    );
+
+    const resolvedNode = await this.resolveGatewayNodeSummary(node);
+    const nodeAliases = this.collectNodeAliases(node, resolvedNode);
+    const existingAliasMatch = this.findEndpointByNodeAliases(nodeAliases);
     if (existingAliasMatch?.id) {
       return existingAliasMatch.id;
     }
+
     const derivedEndpointId = this.buildNodeDerivedEndpointId(node);
     const existingById = this.settings.endpoints.find((entry) => entry.id === derivedEndpointId);
     if (existingById?.id) {
       return existingById.id;
     }
 
-    const derivedUrl = this.buildNodeDerivedEndpointUrl(node);
-    const probeEndpoint: EndpointSettings = {
-      id: `${derivedEndpointId}__probe`,
-      execNodes: [node],
-      transport: "websocket",
-      command: "codex",
-      args: [],
-      url: derivedUrl,
-      requestTimeoutMs: 3_000,
-    };
-    const probeClient = new CodexAppServerModeClient(probeEndpoint, this.api.logger);
-    let available = false;
-    try {
-      await probeClient.readAccount({ profile: "default" });
-      available = true;
-    } catch (error) {
-      this.api.logger.debug?.(
-        `codex auto-node endpoint probe failed node=${node} url=${derivedUrl}: ${String(error)}`,
+    const endpointHost = resolvedNode?.remoteIp?.trim() || node;
+    const derivedUrl = this.buildNodeDerivedEndpointUrl(endpointHost);
+    if (resolvedNode?.remoteIp?.trim() && resolvedNode.remoteIp.trim() !== node) {
+      this.api.logger.info(
+        `codex auto-node endpoint resolved node=${node} remoteIp=${resolvedNode.remoteIp.trim()} url=${derivedUrl}`,
       );
-    } finally {
-      await probeClient.close().catch(() => undefined);
     }
-    if (!available) {
-      return undefined;
+
+    if (!resolvedNode?.remoteIp?.trim()) {
+      const probeEndpoint: EndpointSettings = {
+        id: `${derivedEndpointId}__probe`,
+        execNodes: nodeAliases,
+        transport: "websocket",
+        command: "codex",
+        args: [],
+        url: derivedUrl,
+        requestTimeoutMs: 3_000,
+      };
+      const probeClient = new CodexAppServerModeClient(probeEndpoint, this.api.logger);
+      let available = false;
+      try {
+        await probeClient.readAccount({ profile: "default" });
+        available = true;
+      } catch (error) {
+        this.api.logger.info(
+          `codex auto-node endpoint probe failed node=${node} url=${derivedUrl}: ${String(error)}`,
+        );
+      } finally {
+        await probeClient.close().catch(() => undefined);
+      }
+      if (!available) {
+        return undefined;
+      }
     }
 
     const derivedEndpoint: EndpointSettings = {
       id: derivedEndpointId,
-      execNodes: [node],
+      execNodes: nodeAliases,
       transport: "websocket",
       command: "codex",
       args: [],
@@ -1784,6 +1842,165 @@ export class CodexPluginController {
       `codex auto-node endpoint registered id=${derivedEndpoint.id} node=${node} url=${derivedUrl}`,
     );
     return derivedEndpoint.id;
+  }
+
+  private collectNodeAliases(node: string, summary?: GatewayNodeSummary): string[] {
+    const aliases = [node, summary?.displayName, summary?.nodeId, summary?.remoteIp];
+    const seen = new Set<string>();
+    const normalized: string[] = [];
+    for (const alias of aliases) {
+      const trimmed = alias?.trim();
+      if (!trimmed) {
+        continue;
+      }
+      const key = trimmed.toLowerCase();
+      if (seen.has(key)) {
+        continue;
+      }
+      seen.add(key);
+      normalized.push(trimmed);
+    }
+    return normalized;
+  }
+
+  private findEndpointByNodeAliases(nodeAliases: readonly string[]): EndpointSettings | undefined {
+    if (nodeAliases.length === 0) {
+      return undefined;
+    }
+    const normalizedAliases = new Set(nodeAliases.map((alias) => alias.trim().toLowerCase()).filter(Boolean));
+    return this.settings.endpoints.find((entry) => {
+      const endpointId = entry.id?.trim().toLowerCase();
+      if (endpointId && normalizedAliases.has(endpointId)) {
+        return true;
+      }
+      return (entry.execNodes ?? []).some((alias) => normalizedAliases.has(alias.trim().toLowerCase()));
+    });
+  }
+
+  private async resolveGatewayNodeSummary(node: string): Promise<GatewayNodeSummary | undefined> {
+    const localSummary = await this.readLocalGatewayNodeSummary(node);
+    if (localSummary) {
+      return localSummary;
+    }
+
+    const runCommand = this.api.runtime.system?.runCommandWithTimeout;
+    if (typeof runCommand !== "function") {
+      return undefined;
+    }
+    const needle = node.trim().toLowerCase();
+    if (!needle) {
+      return undefined;
+    }
+
+    try {
+      const result = await runCommand(
+        ["openclaw", "gateway", "call", "node.list", "--params", "{}", "--json"],
+        { timeoutMs: 4_000 },
+      );
+      if (result.code !== 0) {
+        return undefined;
+      }
+      const parsed = JSON.parse(result.stdout) as { nodes?: unknown };
+      if (!Array.isArray(parsed.nodes)) {
+        return undefined;
+      }
+
+      const summaries: GatewayNodeSummary[] = parsed.nodes
+        .filter((entry): entry is Record<string, unknown> => Boolean(entry) && typeof entry === "object")
+        .map((entry) => ({
+          nodeId: typeof entry.nodeId === "string" ? entry.nodeId.trim() || undefined : undefined,
+          displayName: typeof entry.displayName === "string" ? entry.displayName.trim() || undefined : undefined,
+          remoteIp: typeof entry.remoteIp === "string" ? entry.remoteIp.trim() || undefined : undefined,
+          paired: typeof entry.paired === "boolean" ? entry.paired : undefined,
+          connected: typeof entry.connected === "boolean" ? entry.connected : undefined,
+        }));
+
+      const exactMatches = summaries.filter((summary) => {
+        const nodeId = summary.nodeId?.toLowerCase();
+        const displayName = summary.displayName?.toLowerCase();
+        const remoteIp = summary.remoteIp?.toLowerCase();
+        return nodeId === needle || displayName === needle || remoteIp === needle;
+      });
+      const prefixMatches =
+        exactMatches.length > 0 || needle.length < 6
+          ? []
+          : summaries.filter((summary) => summary.nodeId?.toLowerCase().startsWith(needle));
+      const candidates = exactMatches.length > 0 ? exactMatches : prefixMatches;
+      if (candidates.length === 0) {
+        return undefined;
+      }
+
+      candidates.sort((left, right) => {
+        const rightConnected = Number(Boolean(right.connected));
+        const leftConnected = Number(Boolean(left.connected));
+        if (rightConnected !== leftConnected) {
+          return rightConnected - leftConnected;
+        }
+        const rightPaired = Number(Boolean(right.paired));
+        const leftPaired = Number(Boolean(left.paired));
+        return rightPaired - leftPaired;
+      });
+      return candidates[0];
+    } catch {
+      return undefined;
+    }
+  }
+
+  private async readLocalGatewayNodeSummary(node: string): Promise<GatewayNodeSummary | undefined> {
+    const needle = node.trim().toLowerCase();
+    if (!needle) {
+      return undefined;
+    }
+
+    for (const filePath of this.getLocalPairedNodeRegistryPaths()) {
+      try {
+        const raw = await fs.readFile(filePath, "utf-8");
+        const parsed = JSON.parse(raw) as Record<string, unknown>;
+        const registryEntries = Object.entries(parsed).filter(
+          (entry): entry is [string, Record<string, unknown>] => {
+            const value = entry[1];
+            return Boolean(value) && typeof value === "object";
+          },
+        );
+        const summaries: GatewayNodeSummary[] = registryEntries.map(([key, value]) => ({
+            nodeId:
+              typeof value.nodeId === "string"
+                ? value.nodeId.trim() || undefined
+                : typeof value.deviceId === "string"
+                  ? value.deviceId.trim() || undefined
+                  : key.trim() || undefined,
+            displayName: typeof value.displayName === "string" ? value.displayName.trim() || undefined : undefined,
+            remoteIp: typeof value.remoteIp === "string" ? value.remoteIp.trim() || undefined : undefined,
+            paired: true,
+            connected: typeof value.lastConnectedAtMs === "number" ? value.lastConnectedAtMs > 0 : undefined,
+          }));
+
+        const match = summaries.find((summary) => {
+          const nodeId = summary.nodeId?.toLowerCase();
+          const displayName = summary.displayName?.toLowerCase();
+          const remoteIp = summary.remoteIp?.toLowerCase();
+          return nodeId === needle || displayName === needle || remoteIp === needle;
+        });
+        if (match) {
+          this.api.logger.info(
+            `codex auto-node local registry matched node=${node} remoteIp=${match.remoteIp ?? "<none>"} file=${filePath}`,
+          );
+          return match;
+        }
+      } catch {
+        continue;
+      }
+    }
+
+    return undefined;
+  }
+
+  private getLocalPairedNodeRegistryPaths(): string[] {
+    const homeDir = process.env.HOME?.trim() || "/root";
+    return [
+      path.join(homeDir, ".openclaw", "nodes", "paired.json"),
+      path.join(homeDir, ".openclaw", "devices", "paired.json"),
+    ];
   }
 
   private buildNodeDerivedEndpointId(node: string): string {
@@ -1894,19 +2111,27 @@ export class CodexPluginController {
 
   private getSelectedEndpointId(
     conversation: ConversationTarget | null | undefined,
-    _binding?: StoredBinding | StoredPendingBind | null,
+    binding?: StoredBinding | StoredPendingBind | null,
   ): string {
-    return this.getSelectedEndpointResolution(conversation).endpointId;
+    return this.getSelectedEndpointResolution(conversation, binding).endpointId;
   }
 
   private getSelectedEndpointResolution(
     conversation: ConversationTarget | null | undefined,
+    binding?: StoredBinding | StoredPendingBind | null,
   ): EndpointResolution {
     const manualEndpointId = this.getManualEndpointId(conversation);
     if (manualEndpointId) {
       return {
         endpointId: manualEndpointId,
         source: "manual",
+      };
+    }
+    const boundEndpointId = binding ? this.getEndpointIdForBinding(binding) : undefined;
+    if (boundEndpointId) {
+      return {
+        endpointId: boundEndpointId,
+        source: "bound",
       };
     }
     const execContext = this.readExecContextFromConfig(this.getOpenClawConfig());
@@ -1922,6 +2147,84 @@ export class CodexPluginController {
       endpointId: this.settings.defaultEndpoint,
       source: "default",
     };
+  }
+
+  private async getSelectedEndpointResolutionWithNodeFallback(
+    conversation: ConversationTarget | null | undefined,
+    binding?: StoredBinding | StoredPendingBind | null,
+  ): Promise<EndpointResolution> {
+    const manualEndpointId = this.getManualEndpointId(conversation);
+    if (manualEndpointId) {
+      return {
+        endpointId: manualEndpointId,
+        source: "manual",
+      };
+    }
+    const boundEndpointId = binding ? this.getEndpointIdForBinding(binding) : undefined;
+    if (boundEndpointId) {
+      return {
+        endpointId: boundEndpointId,
+        source: "bound",
+      };
+    }
+    const execContext = await this.resolveExecContextForConversation(conversation);
+    this.api.logger.info(
+      `codex endpoint resolution context ${conversation ? this.formatConversationForLog(conversation) : "conversation=<none>"} execHost=${execContext?.host ?? "<none>"} execNode=${execContext?.node ?? "<none>"}`,
+    );
+    const autoEndpointId = this.resolveEndpointIdFromExecContext(execContext);
+    if (autoEndpointId) {
+      this.api.logger.info(
+        `codex endpoint resolution selected configured auto endpoint=${autoEndpointId} node=${execContext?.node ?? "<none>"}`,
+      );
+      return {
+        endpointId: autoEndpointId,
+        source: "auto-node",
+        nodeId: execContext?.node?.trim() || undefined,
+      };
+    }
+    const derivedEndpointId = await this.tryRegisterNodeDerivedEndpoint(execContext);
+    if (derivedEndpointId) {
+      this.api.logger.info(
+        `codex endpoint resolution selected derived auto endpoint=${derivedEndpointId} node=${execContext?.node ?? "<none>"}`,
+      );
+      return {
+        endpointId: derivedEndpointId,
+        source: "auto-node",
+        nodeId: execContext?.node?.trim() || undefined,
+      };
+    }
+    this.api.logger.info(
+      `codex endpoint resolution fell back to default endpoint=${this.settings.defaultEndpoint}`,
+    );
+    return {
+      endpointId: this.settings.defaultEndpoint,
+      source: "default",
+    };
+  }
+
+  private async resolveExecContextForConversation(
+    conversation: ConversationTarget | null | undefined,
+  ): Promise<AgentExecContext | undefined> {
+    if (conversation) {
+      const sessionKey = await this.resolveConversationSessionKey(conversation);
+      this.api.logger.info(
+        `codex exec context lookup ${this.formatConversationForLog(conversation)} session=${sessionKey ?? "<none>"}`,
+      );
+      if (sessionKey) {
+        const sessionExecContext = await this.readExecContextFromSessionKey(sessionKey);
+        if (sessionExecContext) {
+          this.api.logger.info(
+            `codex exec context loaded from session session=${sessionKey} host=${sessionExecContext.host ?? "<none>"} node=${sessionExecContext.node ?? "<none>"}`,
+          );
+          return sessionExecContext;
+        }
+      }
+    }
+    const configExecContext = this.readExecContextFromConfig(this.getOpenClawConfig());
+    this.api.logger.info(
+      `codex exec context fell back to config host=${configExecContext?.host ?? "<none>"} node=${configExecContext?.node ?? "<none>"}`,
+    );
+    return configExecContext;
   }
 
   private async setSelectedEndpointId(conversation: ConversationTarget, endpointId: string): Promise<void> {
@@ -1944,6 +2247,9 @@ export class CodexPluginController {
   private formatEndpointResolutionLabel(selection: EndpointResolution): string {
     if (selection.source === "manual") {
       return `${selection.endpointId} (manual override)`;
+    }
+    if (selection.source === "bound") {
+      return `${selection.endpointId} (bound conversation)`;
     }
     if (selection.source === "auto-node") {
       return `${selection.endpointId} (auto from node${selection.nodeId ? `: ${selection.nodeId}` : ""})`;
@@ -2524,9 +2830,17 @@ export class CodexPluginController {
     }
 
     switch (commandName) {
+      case "exec_nestdev_itermodus":
+        return await this.handleExecNestdevItermodusCommand(conversation, ctx);
       case "cas_resume": {
-        const resolvedEndpointText = conversation
-          ? `Resolved endpoint: ${this.formatEndpointResolutionLabel(this.getSelectedEndpointResolution(conversation))}`
+        const selectedResolution = conversation
+          ? await this.getSelectedEndpointResolutionWithNodeFallback(
+              conversation,
+              binding ?? pendingBind ?? hydratedBinding?.pendingBind ?? null,
+            )
+          : undefined;
+        const resolvedEndpointText = selectedResolution
+          ? `Resolved endpoint: ${this.formatEndpointResolutionLabel(selectedResolution)}`
           : undefined;
         const withResolvedEndpoint = (reply: ReplyPayload): ReplyPayload => {
           if (!resolvedEndpointText) {
@@ -2547,6 +2861,7 @@ export class CodexPluginController {
             ctx,
             pendingBind,
             hydratedBinding?.pendingBind,
+            selectedResolution?.endpointId,
           );
           return withResolvedEndpoint(reply);
         } catch (error) {
@@ -2714,6 +3029,7 @@ export class CodexPluginController {
     ctx: PluginCommandContext,
     pendingBind?: StoredPendingBind | null,
     hydratedPendingBind?: StoredPendingBind,
+    selectedEndpointOverride?: string,
   ): Promise<ReplyPayload> {
     const bindingApi = asScopedBindingApi(ctx);
     if (!conversation) {
@@ -2723,7 +3039,7 @@ export class CodexPluginController {
     if (parsed.error) {
       return { text: parsed.error };
     }
-    const selectedEndpointId = this.getSelectedEndpointId(conversation, binding);
+    const selectedEndpointId = selectedEndpointOverride?.trim() || this.getSelectedEndpointId(conversation, binding);
     const resumeBinding =
       binding && this.getEndpointIdForBinding(binding) === selectedEndpointId ? binding : null;
     const resumePendingBind =
@@ -3426,7 +3742,7 @@ export class CodexPluginController {
       statusMessage?: InteractiveMessageRef;
     },
   ): Promise<PickerRender> {
-    const selection = this.getSelectedEndpointResolution(conversation);
+    const selection = this.getSelectedEndpointResolution(conversation, binding);
     const manualEndpointId = this.getManualEndpointId(conversation);
     const buttons: PluginInteractiveButtons = [];
     if (manualEndpointId) {
@@ -4088,7 +4404,7 @@ export class CodexPluginController {
     if (parsed.error) {
       return { text: parsed.error };
     }
-    const currentSelection = this.getSelectedEndpointResolution(conversation);
+    const currentSelection = this.getSelectedEndpointResolution(conversation, binding);
     if (!parsed.endpointId) {
       const picker = await this.buildEndpointPicker(conversation, binding);
       return buildReplyWithButtons(picker.text, picker.buttons);
@@ -4096,7 +4412,7 @@ export class CodexPluginController {
     const requested = parsed.endpointId.trim();
     if (["auto", "clear"].includes(requested.toLowerCase())) {
       await this.clearSelectedEndpointId(conversation);
-      const nextSelection = this.getSelectedEndpointResolution(conversation);
+      const nextSelection = this.getSelectedEndpointResolution(conversation, binding);
       return { text: this.buildEndpointSelectionNotice(nextSelection, binding, conversation) };
     }
     const endpoint = this.settings.endpoints.find((entry) => entry.id === requested);
@@ -4114,7 +4430,7 @@ export class CodexPluginController {
       };
     }
     await this.setSelectedEndpointId(conversation, endpoint.id || requested);
-    const nextSelection = this.getSelectedEndpointResolution(conversation);
+    const nextSelection = this.getSelectedEndpointResolution(conversation, binding);
     return { text: this.buildEndpointSelectionNotice(nextSelection, binding, conversation) };
   }
 
@@ -5830,100 +6146,24 @@ export class CodexPluginController {
     conversation: ConversationTarget,
     picker: PickerRender,
   ): Promise<void> {
-    this.api.logger.debug(
-      `codex discord picker send conversation=${conversation.conversationId} rows=${picker.buttons?.length ?? 0}`,
+    this.api.logger.info(
+      `codex discord picker send conversation=${conversation.conversationId} rows=${picker.buttons?.length ?? 0} textChars=${picker.text.length}`,
     );
-    const outbound = await this.loadDiscordOutboundAdapter();
-    if (outbound?.sendPayload) {
-      await outbound.sendPayload({
-        cfg: this.getOpenClawConfig(),
-        to: conversation.conversationId,
-        accountId: conversation.accountId,
-        payload: {
-          text: picker.text,
-          channelData: {
-            discord: {
-              components: this.buildDiscordPickerSpec(picker),
-            },
-          },
-        },
-      });
-      return;
-    }
-    const legacySend = (this.api.runtime.channel as {
-      discord?: {
-        sendComponentMessage?: (
-          to: string,
-          spec: DiscordComponentMessageSpec,
-          opts?: { accountId?: string },
-        ) => Promise<unknown>;
-      };
-    }).discord?.sendComponentMessage;
-    if (typeof legacySend === "function") {
-      await legacySend(
-        conversation.conversationId,
-        this.buildDiscordPickerSpec(picker),
-        {
-          accountId: conversation.accountId,
-        },
-      );
-      return;
-    }
-    const runtimeApi = await this.loadDiscordRuntimeApi();
-    if (typeof runtimeApi?.sendDiscordComponentMessage === "function") {
-      await runtimeApi.sendDiscordComponentMessage(
-        conversation.conversationId,
-        this.buildDiscordPickerSpec(picker),
-        {
-          cfg: this.getOpenClawConfig(),
-          accountId: conversation.accountId,
-        },
-      );
-      return;
-    }
-    throw new Error("Discord component messaging is unavailable.");
+    await this.sendDiscordComponentSpec(conversation, this.buildDiscordPickerSpec(picker));
   }
 
   private async sendDiscordPickerMessageLegacy(
     conversation: ConversationTarget,
     picker: PickerRender,
   ): Promise<unknown> {
-    const legacySend = (this.api.runtime.channel as {
-      discord?: {
-        sendComponentMessage?: (
-          to: string,
-          spec: DiscordComponentMessageSpec,
-          opts?: { accountId?: string },
-        ) => Promise<unknown>;
-      };
-    }).discord?.sendComponentMessage;
-    if (typeof legacySend === "function") {
-      return await legacySend(
-        conversation.conversationId,
-        this.buildDiscordPickerSpec(picker),
-        {
-          accountId: conversation.accountId,
-        },
-      );
-    }
-    const runtimeApi = await this.loadDiscordRuntimeApi();
-    if (typeof runtimeApi?.sendDiscordComponentMessage === "function") {
-      return await runtimeApi.sendDiscordComponentMessage(
-        conversation.conversationId,
-        this.buildDiscordPickerSpec(picker),
-        {
-          cfg: this.getOpenClawConfig(),
-          accountId: conversation.accountId,
-        },
-      );
-    }
-    throw new Error("Discord component messaging is unavailable.");
+    return await this.sendDiscordComponentSpec(conversation, this.buildDiscordPickerSpec(picker));
   }
 
   private buildDiscordPickerSpec(picker: PickerRender): DiscordComponentMessageSpec {
+    const packedRows = packDiscordPickerRows(picker.buttons);
     return {
       text: picker.text,
-      blocks: (picker.buttons ?? []).map((row) => ({
+      blocks: packedRows.map((row) => ({
         type: "actions" as const,
         buttons: row.map((button) => ({
           label: truncateDiscordLabel(button.text),
@@ -5975,37 +6215,154 @@ export class CodexPluginController {
   }
 
   private async loadDiscordRuntimeApi(): Promise<DiscordRuntimeApiModule | undefined> {
-    try {
-      const openClawEntrypointPath = resolveOpenClawEntrypointPath();
-      const runtimeApiPath = resolveCompatFallbackPath(
-        openClawEntrypointPath,
-        "dist/extensions/discord/runtime-api.js",
-      );
-      if (!existsSync(runtimeApiPath)) {
-        return undefined;
+    for (const runtimeApiPath of this.getOpenClawCompatCandidatePaths("dist/extensions/discord/runtime-api.js")) {
+      try {
+        const module = (await import(pathToFileURL(runtimeApiPath).href)) as DiscordRuntimeApiModule;
+        this.api.logger.info(`codex discord runtime api loaded path=${runtimeApiPath}`);
+        return module;
+      } catch (error) {
+        this.api.logger.debug?.(
+          `codex discord runtime api import failed path=${runtimeApiPath}: ${String(error)}`,
+        );
       }
-      return (await import(pathToFileURL(runtimeApiPath).href)) as DiscordRuntimeApiModule;
-    } catch (error) {
-      this.api.logger.debug?.(`codex discord runtime api unavailable: ${String(error)}`);
-      return undefined;
     }
+    return undefined;
   }
 
   private async loadDiscordExtensionApi(): Promise<DiscordExtensionApiModule | undefined> {
-    try {
-      const openClawEntrypointPath = resolveOpenClawEntrypointPath();
-      const apiPath = resolveCompatFallbackPath(
-        openClawEntrypointPath,
-        "dist/extensions/discord/api.js",
-      );
-      if (!existsSync(apiPath)) {
-        return undefined;
+    for (const apiPath of this.getOpenClawCompatCandidatePaths("dist/extensions/discord/api.js")) {
+      try {
+        return (await import(pathToFileURL(apiPath).href)) as DiscordExtensionApiModule;
+      } catch (error) {
+        this.api.logger.debug?.(
+          `codex discord extension api import failed path=${apiPath}: ${String(error)}`,
+        );
       }
-      return (await import(pathToFileURL(apiPath).href)) as DiscordExtensionApiModule;
-    } catch (error) {
-      this.api.logger.debug?.(`codex discord extension api unavailable: ${String(error)}`);
-      return undefined;
     }
+    return undefined;
+  }
+
+  private getOpenClawCompatCandidatePaths(fallbackRelativePath: string): string[] {
+    const candidates: string[] = [];
+    const seen = new Set<string>();
+    const pushCandidate = (baseEntrypointPath: string | undefined) => {
+      const trimmed = baseEntrypointPath?.trim();
+      if (!trimmed) {
+        return;
+      }
+      const resolved = resolveCompatFallbackPath(trimmed, fallbackRelativePath);
+      if (!existsSync(resolved) || seen.has(resolved)) {
+        return;
+      }
+      seen.add(resolved);
+      candidates.push(resolved);
+    };
+
+    try {
+      pushCandidate(resolveOpenClawEntrypointPath());
+    } catch (error) {
+      this.api.logger.debug?.(`codex openclaw compat entrypoint resolution failed: ${String(error)}`);
+    }
+
+    try {
+      pushCandidate(require.resolve("openclaw"));
+    } catch (error) {
+      this.api.logger.debug?.(`codex openclaw package resolve failed: ${String(error)}`);
+    }
+
+    // Also probe common global installs. In the plugin worktree, require.resolve("openclaw")
+    // can point at a bundled dependency tree that does not include Discord runtime modules.
+    pushCandidate("/root/.local/lib/node_modules/openclaw/dist/index.js");
+    pushCandidate("/usr/local/lib/node_modules/openclaw/dist/index.js");
+    pushCandidate("/usr/lib/node_modules/openclaw/dist/index.js");
+
+    return candidates;
+  }
+
+  private async sendDiscordComponentSpec(
+    conversation: ConversationTarget,
+    spec: DiscordComponentMessageSpec,
+  ): Promise<unknown> {
+    const attempts: Array<{ label: string; send: () => Promise<unknown> }> = [];
+    const legacySend = (this.api.runtime.channel as {
+      discord?: {
+        sendComponentMessage?: (
+          to: string,
+          spec: DiscordComponentMessageSpec,
+          opts?: { accountId?: string },
+        ) => Promise<unknown>;
+      };
+    }).discord?.sendComponentMessage;
+    if (typeof legacySend === "function") {
+      attempts.push({
+        label: "legacy",
+        send: async () =>
+          await legacySend(conversation.conversationId, spec, {
+            accountId: conversation.accountId,
+          }),
+      });
+    }
+
+    const runtimeApi = await this.loadDiscordRuntimeApi();
+    if (typeof runtimeApi?.sendDiscordComponentMessage === "function") {
+      attempts.push({
+        label: "runtime-api",
+        send: async () =>
+          await runtimeApi.sendDiscordComponentMessage!(conversation.conversationId, spec, {
+            cfg: this.getOpenClawConfig(),
+            accountId: conversation.accountId,
+          }),
+      });
+    }
+
+    const outbound = await this.loadDiscordOutboundAdapter();
+    if (outbound?.sendPayload) {
+      attempts.push({
+        label: "outbound-adapter",
+        send: async () =>
+          await outbound.sendPayload!({
+            cfg: this.getOpenClawConfig(),
+            to: conversation.conversationId,
+            accountId: conversation.accountId,
+            payload: {
+              text: spec.text,
+              channelData: {
+                discord: {
+                  components: spec,
+                },
+              },
+            },
+        }),
+      });
+    }
+
+    this.api.logger.info(
+      `codex discord component transport conversation=${conversation.conversationId} attempts=${attempts.map((attempt) => attempt.label).join(",") || "<none>"} textChars=${spec.text?.length ?? 0} blocks=${spec.blocks?.length ?? 0}`,
+    );
+    let lastError: unknown;
+    for (const attempt of attempts) {
+      try {
+        const result = await attempt.send();
+        this.api.logger.info(
+          `codex discord component send via ${attempt.label} succeeded conversation=${conversation.conversationId}`,
+        );
+        return result;
+      } catch (error) {
+        lastError = error;
+        const detail = error instanceof Error ? error.stack ?? error.message : String(error);
+        this.api.logger.warn(
+          `codex discord component send via ${attempt.label} failed conversation=${conversation.conversationId}: ${detail}`,
+        );
+      }
+    }
+
+    if (lastError) {
+      throw lastError;
+    }
+    this.api.logger.warn(
+      `codex discord component transport unavailable conversation=${conversation.conversationId}`,
+    );
+    throw new Error("Discord component messaging is unavailable.");
   }
 
   private async editDiscordComponentMessage(
@@ -6730,7 +7087,7 @@ export class CodexPluginController {
             : Promise.resolve({
                 text: this.formatEndpointListText({
                   conversation,
-                  selection: this.getSelectedEndpointResolution(conversation),
+                  selection: this.getSelectedEndpointResolution(conversation, binding),
                   binding,
                 }),
                 buttons: undefined,
@@ -6808,7 +7165,7 @@ export class CodexPluginController {
       await this.setSelectedEndpointId(conversation, callback.endpointId);
       const refreshedBinding = this.store.getBinding(callback.conversation);
       const text = this.buildEndpointSelectionNotice(
-        this.getSelectedEndpointResolution(conversation),
+        this.getSelectedEndpointResolution(conversation, refreshedBinding),
         refreshedBinding,
         conversation,
       );
@@ -6858,7 +7215,7 @@ export class CodexPluginController {
       await this.clearSelectedEndpointId(conversation);
       const refreshedBinding = this.store.getBinding(callback.conversation);
       const text = this.buildEndpointSelectionNotice(
-        this.getSelectedEndpointResolution(conversation),
+        this.getSelectedEndpointResolution(conversation, refreshedBinding),
         refreshedBinding,
         conversation,
       );
@@ -7572,7 +7929,7 @@ export class CodexPluginController {
     binding: StoredBinding | null,
     bindingActive: boolean,
   ): Promise<string> {
-    const selection = this.getSelectedEndpointResolution(conversation);
+    const selection = this.getSelectedEndpointResolution(conversation, binding);
     const selectedEndpointId = selection.endpointId;
     const activeRun =
       bindingActive && conversation
@@ -7973,6 +8330,258 @@ export class CodexPluginController {
     return this.lastRuntimeConfig ?? (this.api as OpenClawPluginApi & { config?: unknown }).config;
   }
 
+  private async handleExecNestdevItermodusCommand(
+    conversation: ConversationTarget | null,
+    ctx: PluginCommandContext,
+  ): Promise<ReplyPayload> {
+    if (!conversation) {
+      return { text: "This command needs a Telegram or Discord conversation." };
+    }
+
+    try {
+      const sessionKey = await this.resolveConversationSessionKey(conversation);
+      if (!sessionKey) {
+        return {
+          text: "Could not resolve the OpenClaw session for this conversation, so I could not persist exec defaults.",
+        };
+      }
+
+      await this.patchConversationExecSession(sessionKey, {
+        execHost: "node",
+        execSecurity: "full",
+        execAsk: "off",
+        execNode: "nestdev",
+      });
+
+      this.api.logger.info(
+        `codex session exec defaults updated ${this.formatConversationForLog(conversation)} session=${sessionKey} host=node node=nestdev`,
+      );
+
+      return {
+        text: [
+          "Exec defaults updated for this conversation.",
+          `Session: ${sessionKey}`,
+          "Host: node",
+          "Node: nestdev",
+          "Security: full",
+          "Ask: off",
+          "",
+          "Now run /cas_resume.",
+        ].join("\n"),
+      };
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      this.api.logger.warn(
+        `codex exec preset update failed ${this.formatConversationForLog(conversation)}: ${message}`,
+      );
+      return { text: `Failed to update exec defaults for this conversation: ${message}` };
+    }
+  }
+
+  private async resolveConversationSessionKey(
+    conversation: ConversationTarget,
+  ): Promise<string | undefined> {
+    const boundSession = this.api.runtime.channel.bindings?.resolveByConversation?.(conversation);
+    const targetSessionKey =
+      typeof boundSession?.targetSessionKey === "string" ? boundSession.targetSessionKey.trim() : "";
+    if (targetSessionKey.startsWith("agent:")) {
+      return targetSessionKey;
+    }
+
+    const sessions = await this.listGatewaySessions();
+    const matched = this.findGatewaySessionForConversation(sessions, conversation);
+    if (matched?.key?.trim()) {
+      return matched.key.trim();
+    }
+
+    return this.deriveConversationSessionKey(conversation);
+  }
+
+  private deriveConversationSessionKey(conversation: ConversationTarget): string | undefined {
+    const channel = conversation.channel.trim().toLowerCase();
+    const conversationId = conversation.conversationId?.trim();
+    if (!channel || !conversationId) {
+      return undefined;
+    }
+    return `agent:main:${channel}:${conversationId}`;
+  }
+
+  private async readExecContextFromSessionKey(sessionKey: string): Promise<AgentExecContext | undefined> {
+    const storePath = this.resolveSessionStorePath(sessionKey);
+    if (!storePath) {
+      this.api.logger.info(`codex exec context store path unavailable session=${sessionKey}`);
+      return undefined;
+    }
+
+    try {
+      const raw = await fs.readFile(storePath, "utf-8");
+      const parsed = JSON.parse(raw) as Record<string, unknown>;
+      const entry = asRecord(parsed[sessionKey]);
+      if (!entry) {
+        this.api.logger.info(`codex exec context session entry missing session=${sessionKey} store=${storePath}`);
+        return undefined;
+      }
+      const host = typeof entry.execHost === "string" ? entry.execHost.trim() || undefined : undefined;
+      const node = typeof entry.execNode === "string" ? entry.execNode.trim() || undefined : undefined;
+      if (!host && !node) {
+        this.api.logger.info(`codex exec context session entry has no exec defaults session=${sessionKey} store=${storePath}`);
+        return undefined;
+      }
+      return { host, node };
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      this.api.logger.warn(
+        `codex exec context session read failed session=${sessionKey} store=${storePath}: ${message}`,
+      );
+      return undefined;
+    }
+  }
+
+  private resolveSessionStorePath(sessionKey: string): string | undefined {
+    const match = /^agent:([^:]+):/.exec(sessionKey.trim());
+    const agentId = match?.[1]?.trim();
+    if (!agentId) {
+      return undefined;
+    }
+    const homeDir = process.env.HOME?.trim() || "/root";
+    return path.join(homeDir, ".openclaw", "agents", agentId, "sessions", "sessions.json");
+  }
+
+  private async listGatewaySessions(): Promise<GatewaySessionSummary[]> {
+    const parsed = await this.runOpenClawGatewayJson<{ sessions?: unknown }>("sessions.list", {
+      limit: 500,
+    });
+    if (!Array.isArray(parsed.sessions)) {
+      return [];
+    }
+    return parsed.sessions.filter(
+      (entry): entry is GatewaySessionSummary => Boolean(entry) && typeof entry === "object",
+    );
+  }
+
+  private findGatewaySessionForConversation(
+    sessions: readonly GatewaySessionSummary[],
+    conversation: ConversationTarget,
+  ): GatewaySessionSummary | undefined {
+    const conversationChannel = conversation.channel.trim().toLowerCase();
+    const conversationAccountId = conversation.accountId?.trim() || "default";
+    const candidateTargets =
+      conversationChannel === "discord"
+        ? [conversation.conversationId, conversation.parentConversationId]
+            .map((value) => normalizeDiscordConversationId(value))
+            .filter((value): value is string => Boolean(value))
+        : [conversation.parentConversationId ?? conversation.conversationId]
+            .map((value) => value?.trim())
+            .filter((value): value is string => Boolean(value));
+    const candidateThreadIds =
+      conversationChannel === "discord"
+        ? [denormalizeDiscordConversationId(conversation.conversationId)]
+            .filter((value): value is string => Boolean(value))
+        : [
+            typeof conversation.threadId === "number" ? String(conversation.threadId) : undefined,
+            typeof conversation.threadId === "string" ? conversation.threadId.trim() : undefined,
+          ].filter((value): value is string => Boolean(value));
+
+    let bestMatch: { score: number; session: GatewaySessionSummary } | undefined;
+    for (const session of sessions) {
+      const key = session.key?.trim();
+      const deliveryContext = session.deliveryContext;
+      const sessionChannel = deliveryContext?.channel?.trim().toLowerCase();
+      if (!key || sessionChannel !== conversationChannel) {
+        continue;
+      }
+
+      const sessionAccountId = deliveryContext?.accountId?.trim() || "default";
+      if (conversationAccountId && sessionAccountId !== conversationAccountId) {
+        continue;
+      }
+
+      const sessionTarget =
+        conversationChannel === "discord"
+          ? normalizeDiscordConversationId(deliveryContext?.to)
+          : deliveryContext?.to?.trim();
+      if (!sessionTarget || !candidateTargets.includes(sessionTarget)) {
+        continue;
+      }
+
+      let score = 2;
+      const sessionThreadId =
+        typeof deliveryContext?.threadId === "number"
+          ? String(deliveryContext.threadId)
+          : typeof deliveryContext?.threadId === "string"
+            ? deliveryContext.threadId.trim()
+            : undefined;
+      if (candidateThreadIds.length > 0 && sessionThreadId && candidateThreadIds.includes(sessionThreadId)) {
+        score += 4;
+      } else if (candidateThreadIds.length === 0 && !sessionThreadId) {
+        score += 1;
+      }
+      if (key.startsWith("agent:main:")) {
+        score += 1;
+      }
+
+      if (!bestMatch || score > bestMatch.score) {
+        bestMatch = { score, session };
+      }
+    }
+
+    if (bestMatch) {
+      this.api.logger.debug(
+        `codex session lookup matched ${this.formatConversationForLog(conversation)} session=${bestMatch.session.key ?? "<none>"}`,
+      );
+    }
+    return bestMatch?.session;
+  }
+
+  private async patchConversationExecSession(
+    sessionKey: string,
+    patch: {
+      execHost: "node";
+      execSecurity: "full";
+      execAsk: "off";
+      execNode: string;
+    },
+  ): Promise<void> {
+    await this.runOpenClawGatewayJson("sessions.patch", {
+      key: sessionKey,
+      ...patch,
+    });
+  }
+
+  private async runOpenClawGatewayJson<T>(method: string, params: Record<string, unknown>): Promise<T> {
+    const command = [
+      "openclaw",
+      "gateway",
+      "call",
+      method,
+      "--params",
+      JSON.stringify(params),
+      "--json",
+    ];
+    const runCommand = this.api.runtime.system?.runCommandWithTimeout;
+    if (typeof runCommand === "function") {
+      const result = await runCommand(command, { timeoutMs: 10_000 });
+      if (result.code !== 0) {
+        const detail = result.stderr.trim() || result.stdout.trim() || `exit ${result.code}`;
+        throw new Error(detail);
+      }
+      return JSON.parse(result.stdout) as T;
+    }
+
+    try {
+      const result = await execFileAsync(command[0]!, command.slice(1), { timeout: 10_000 });
+      return JSON.parse(result.stdout) as T;
+    } catch (error) {
+      const detail =
+        typeof error === "object" && error && "stderr" in error && typeof error.stderr === "string"
+          ? error.stderr.trim()
+          : error instanceof Error
+            ? error.message
+            : String(error);
+      throw new Error(detail || `openclaw gateway call ${method} failed`);
+    }
+  }
+
   private async loadTelegramOutboundAdapter(): Promise<TelegramOutboundAdapter | undefined> {
     const loadAdapter = this.api.runtime.channel.outbound?.loadAdapter;
     if (typeof loadAdapter !== "function") {
@@ -7984,9 +8593,14 @@ export class CodexPluginController {
   private async loadDiscordOutboundAdapter(): Promise<DiscordOutboundAdapter | undefined> {
     const loadAdapter = this.api.runtime.channel.outbound?.loadAdapter;
     if (typeof loadAdapter !== "function") {
+      this.api.logger.warn("codex discord outbound adapter loader unavailable");
       return undefined;
     }
-    return (await loadAdapter("discord")) as DiscordOutboundAdapter | undefined;
+    const adapter = (await loadAdapter("discord")) as DiscordOutboundAdapter | undefined;
+    this.api.logger.info(
+      `codex discord outbound adapter loaded sendPayload=${typeof adapter?.sendPayload === "function"} sendText=${typeof adapter?.sendText === "function"} sendMedia=${typeof adapter?.sendMedia === "function"}`,
+    );
+    return adapter;
   }
 
   private async sendTelegramTextChunk(
@@ -8227,7 +8841,7 @@ export class CodexPluginController {
         return await legacyTyping({
           to: conversation.parentConversationId ?? conversation.conversationId,
           accountId: conversation.accountId,
-          messageThreadId: conversation.threadId,
+          messageThreadId: typeof conversation.threadId === "number" ? conversation.threadId : undefined,
         });
       }
       return await this.startTelegramTypingLease(conversation);
@@ -8620,7 +9234,7 @@ export class CodexPluginController {
   ): Promise<void> {
     if (isTelegramChannel(conversation.channel) && conversation.threadId != null) {
       const legacyRename = this.api.runtime.channel.telegram?.conversationActions?.renameTopic;
-      if (typeof legacyRename === "function") {
+      if (typeof legacyRename === "function" && typeof conversation.threadId === "number") {
         await legacyRename(
           conversation.parentConversationId ?? conversation.conversationId,
           conversation.threadId,

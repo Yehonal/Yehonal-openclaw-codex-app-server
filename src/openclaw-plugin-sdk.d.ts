@@ -166,6 +166,19 @@ declare module "openclaw/plugin-sdk" {
       state: {
         resolveStateDir: () => string;
       };
+      system?: {
+        runCommandWithTimeout?: (
+          command: string[],
+          opts?: { timeoutMs?: number },
+        ) => Promise<{
+          stdout: string;
+          stderr: string;
+          code: number;
+          signal: string | null;
+          killed: boolean;
+          termination: "exit" | "signal" | "timeout";
+        }>;
+      };
       channel: {
         bindings: {
           bind: (input: {

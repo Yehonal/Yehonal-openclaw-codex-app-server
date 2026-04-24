@@ -14,6 +14,12 @@ type CommandHelpEntry = {
 };
 
 export const COMMAND_HELP: Record<CommandName, CommandHelpEntry> = {
+  exec_nestdev_itermodus: {
+    summary: COMMAND_SUMMARY.exec_nestdev_itermodus,
+    usage: "/exec_nestdev_itermodus",
+    examples: ["/exec_nestdev_itermodus"],
+    notes: "Updates the current conversation session so future exec-aware flows use host=node, node=nestdev, security=full, and ask=off. Run /cas_resume right after it.",
+  },
   cas_resume: {
     summary: COMMAND_SUMMARY.cas_resume,
     usage: "/cas_resume [--projects|-p] [--new [project]] [--all|-a] [--cwd <path>] [--sync] [--model <name>] [--fast|--no-fast] [--yolo|--no-yolo] [filter]",

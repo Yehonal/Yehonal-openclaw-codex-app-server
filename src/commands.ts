@@ -1,4 +1,5 @@
 export const COMMANDS = [
+  ["exec_nestdev_itermodus", "Set this conversation's exec defaults to node=nestdev so /cas_resume can attach to the remote Codex app server."],
   ["cas_resume", "Resume or create a Codex thread, with optional model, fast mode, and permissions overrides."],
   ["cas_detach", "Detach this conversation from the current Codex thread."],
   ["cas_reset", "Force-clear Codex binding state for this conversation and detach it."],
