@@ -2879,6 +2879,54 @@ describe("Discord controller flows", () => {
     );
   });
 
+  it("reports detach success when only local CAS binding state is removed", async () => {
+    const { controller } = await createControllerHarness();
+    await (controller as any).store.upsertBinding({
+      conversation: {
+        channel: "telegram",
+        accountId: "default",
+        conversationId: "123:topic:456",
+        parentConversationId: "123",
+      },
+      sessionKey: "session-1",
+      threadId: "thread-1",
+      workspaceDir: "/repo/openclaw",
+      threadTitle: "Discord Thread",
+      updatedAt: Date.now(),
+    });
+
+    const reply = await controller.handleCommand(
+      "cas_detach",
+      buildTelegramCommandContext({
+        commandBody: "/cas_detach",
+        messageThreadId: 456,
+        detachConversationBinding: vi.fn(async () => ({ removed: false })),
+      }),
+    );
+
+    expect(reply).toEqual({ text: "Detached this conversation from Codex." });
+    expect((controller as any).store.getBinding({
+      channel: "telegram",
+      accountId: "default",
+      conversationId: "123:topic:456",
+      parentConversationId: "123",
+    })).toBeNull();
+  });
+
+  it("does not show an active Codex binding from runtime binding alone", async () => {
+    const { controller } = await createControllerHarness();
+
+    const reply = await controller.handleCommand(
+      "cas_status",
+      buildTelegramCommandContext({
+        commandBody: "/cas_status",
+        getCurrentConversationBinding: vi.fn(async () => ({ bindingId: "binding-1" })),
+      }),
+    );
+
+    expect(reply.text).toContain("Binding: none");
+  });
+
   it("pins the Discord status message and unpins it on detach", async () => {
     const { controller, sendComponentMessage } = await createControllerHarness();
     const fetchMock = vi.mocked(fetch);

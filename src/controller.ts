@@ -3134,10 +3134,11 @@ export class CodexPluginController {
         if (!conversation) {
           return { text: "This command needs a Telegram or Discord conversation." };
         }
+        const hadLocalBinding = Boolean(binding || pendingBind);
         const detachResult = await bindingApi.detachConversationBinding?.();
         await this.unbindConversation(conversation);
         return {
-          text: detachResult?.removed
+          text: detachResult?.removed || hadLocalBinding
             ? "Detached this conversation from Codex."
             : "This conversation is not currently bound to Codex.",
         };
@@ -3155,7 +3156,7 @@ export class CodexPluginController {
           conversation,
           binding,
           args,
-          Boolean(currentBinding || binding),
+          Boolean(binding),
           commandSessionKey,
         );
       case "cas_stop":
