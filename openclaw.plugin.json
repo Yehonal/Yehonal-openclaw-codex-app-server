@@ -96,6 +96,9 @@
             "requestTimeoutMs": {
               "type": "number",
               "minimum": 100
+            },
+            "defaultWorkspaceDir": {
+              "type": "string"
             }
           }
         }
@@ -109,6 +112,15 @@
       },
       "defaultModel": {
         "type": "string"
+      },
+      "defaultReasoningEffort": {
+        "type": "string",
+        "enum": [
+          "low",
+          "medium",
+          "high",
+          "xhigh"
+        ]
       },
       "defaultServiceTier": {
         "type": "string"
@@ -188,6 +200,10 @@
     },
     "defaultModel": {
       "label": "Default Model",
+      "advanced": true
+    },
+    "defaultReasoningEffort": {
+      "label": "Default Reasoning Effort",
       "advanced": true
     },
     "defaultServiceTier": {

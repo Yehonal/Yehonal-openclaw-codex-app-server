@@ -19,6 +19,7 @@ export type EndpointSettings = {
   args: string[];
   url?: string;
   headers?: Record<string, string>;
+  defaultWorkspaceDir?: string;
   requestTimeoutMs: number;
 };
 
@@ -28,6 +29,7 @@ export type PluginSettings = {
   endpoints: EndpointSettings[];
   defaultWorkspaceDir?: string;
   defaultModel?: string;
+  defaultReasoningEffort?: string;
   defaultServiceTier?: string;
   inboundAudioTranscription?: InboundAudioTranscriptionSettings;
 };

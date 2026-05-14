@@ -110,6 +110,7 @@ export function resolvePluginSettings(rawConfig: unknown): PluginSettings {
       args: readStringArray(entry, "args"),
       url: readString(entry, "url"),
       headers: Object.keys(headers).length > 0 ? headers : undefined,
+      defaultWorkspaceDir: readString(entry, "defaultWorkspaceDir"),
       requestTimeoutMs: readNumber(entry, "requestTimeoutMs", DEFAULT_REQUEST_TIMEOUT_MS, 100),
     };
   };
@@ -135,6 +136,7 @@ export function resolvePluginSettings(rawConfig: unknown): PluginSettings {
             args: readStringArray(record, "args"),
             url: readString(record, "url"),
             headers: Object.keys(legacyHeaders).length > 0 ? legacyHeaders : undefined,
+            defaultWorkspaceDir: readString(record, "defaultWorkspaceDir"),
             requestTimeoutMs: readNumber(
               record,
               "requestTimeoutMs",
@@ -154,6 +156,7 @@ export function resolvePluginSettings(rawConfig: unknown): PluginSettings {
     endpoints,
     defaultWorkspaceDir: readString(record, "defaultWorkspaceDir"),
     defaultModel: readString(record, "defaultModel"),
+    defaultReasoningEffort: readString(record, "defaultReasoningEffort"),
     defaultServiceTier: readString(record, "defaultServiceTier"),
     inboundAudioTranscription: resolveInboundAudioTranscription(record),
   };
@@ -162,12 +165,14 @@ export function resolvePluginSettings(rawConfig: unknown): PluginSettings {
 export function resolveWorkspaceDir(params: {
   requested?: string;
   bindingWorkspaceDir?: string;
+  endpointWorkspaceDir?: string;
   configuredWorkspaceDir?: string;
   serviceWorkspaceDir?: string;
 }): string {
   return (
     params.requested?.trim() ||
     params.bindingWorkspaceDir?.trim() ||
+    params.endpointWorkspaceDir?.trim() ||
     params.configuredWorkspaceDir?.trim() ||
     params.serviceWorkspaceDir?.trim() ||
     process.cwd()

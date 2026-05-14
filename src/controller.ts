@@ -17,6 +17,7 @@ import type {
   ConversationRef,
 } from "openclaw/plugin-sdk";
 import { getCurrentPluginConversationBinding } from "openclaw/plugin-sdk/conversation-runtime";
+import { loadSessionStore, resolveStorePath } from "openclaw/plugin-sdk/config-runtime";
 import { resolvePluginSettings, resolveWorkspaceDir } from "./config.js";
 import { CodexAppServerModeClient, type ActiveCodexRun, isMissingThreadError } from "./client.js";
 import { getThreadDisplayTitle } from "./thread-display.js";
@@ -1136,13 +1137,15 @@ function buildDesiredThreadConfiguration(
   threadState: ThreadState | undefined,
   binding: StoredBinding | null,
   modelFallback?: string,
+  reasoningEffortFallback?: string,
 ): DesiredThreadConfiguration {
   const effectiveState = applyBindingPreferencesToThreadState(threadState, binding) ?? threadState;
   const model = effectiveState?.model?.trim() || modelFallback;
   return {
     effectiveState,
     model,
-    reasoningEffort: normalizeReasoningEffort(effectiveState?.reasoningEffort),
+    reasoningEffort: normalizeReasoningEffort(effectiveState?.reasoningEffort)
+      ?? normalizeReasoningEffort(reasoningEffortFallback),
     serviceTier: modelSupportsFast(model)
       ? requestServiceTierFromPreference(effectiveState?.serviceTier)
       : null,
@@ -1512,6 +1515,7 @@ export class CodexPluginController {
   private readonly clients = new Map<string, CodexAppServerModeClient>();
   private readonly activeRuns = new Map<string, ActiveRunRecord>();
   private readonly threadChangesCache = new Map<string, Promise<boolean | undefined>>();
+  private readonly conversationSessionKeys = new Map<string, string>();
   private readonly store;
   private serviceWorkspaceDir?: string;
   private lastRuntimeConfig?: unknown;
@@ -1572,6 +1576,7 @@ export class CodexPluginController {
       url: string | null;
       command: string;
       args: string[];
+      defaultWorkspaceDir: string | null;
       requestTimeoutMs: number;
       supportsFullAccess: boolean;
     }>;
@@ -1588,6 +1593,7 @@ export class CodexPluginController {
         url: endpoint.url ?? null,
         command: endpoint.command,
         args: [...endpoint.args],
+        defaultWorkspaceDir: endpoint.defaultWorkspaceDir ?? null,
         requestTimeoutMs: endpoint.requestTimeoutMs,
         supportsFullAccess: this.getClientForEndpoint(endpoint.id).hasProfile("full-access"),
       })),
@@ -1619,6 +1625,7 @@ export class CodexPluginController {
       ? undefined
       : resolveWorkspaceDir({
           requested: params.workspaceDir,
+          endpointWorkspaceDir: this.getConfiguredWorkspaceDirForEndpoint(endpointId),
           configuredWorkspaceDir: this.settings.defaultWorkspaceDir,
           serviceWorkspaceDir: this.serviceWorkspaceDir,
         });
@@ -1713,6 +1720,7 @@ export class CodexPluginController {
     const permissionsMode = this.resolveAgentPermissionsMode(endpointId, params.permissionsMode);
     const workspaceDir = resolveWorkspaceDir({
       requested: params.workspaceDir,
+      endpointWorkspaceDir: this.getConfiguredWorkspaceDirForEndpoint(endpointId),
       configuredWorkspaceDir: this.settings.defaultWorkspaceDir,
       serviceWorkspaceDir: this.serviceWorkspaceDir,
     });
@@ -1773,7 +1781,7 @@ export class CodexPluginController {
       runId: `agent-${crypto.randomUUID()}`,
       existingThreadId: threadId || undefined,
       model: params.model?.trim() || this.settings.defaultModel,
-      reasoningEffort: params.reasoningEffort?.trim() || undefined,
+      reasoningEffort: params.reasoningEffort?.trim() || this.settings.defaultReasoningEffort,
       serviceTier: params.serviceTier?.trim() || this.settings.defaultServiceTier,
       collaborationMode: params.collaborationMode,
       onPendingInput: async (state) => {
@@ -1848,51 +1856,63 @@ export class CodexPluginController {
   ): Promise<string | undefined> {
     const host = execContext?.host?.trim().toLowerCase();
     const node = execContext?.node?.trim();
-    if (host !== "node" || !node) {
+    if (!this.shouldUseNodeDerivedEndpointResolution(host, node)) {
       return undefined;
     }
-    const normalizedNode = node.toLowerCase();
+    const resolvedNode = node?.trim();
+    if (!resolvedNode) {
+      return undefined;
+    }
+    const normalizedNode = resolvedNode.toLowerCase();
     const existingAliasMatch = this.settings.endpoints.find((entry) =>
       (entry.execNodes ?? []).some((alias) => alias.trim().toLowerCase() === normalizedNode),
     );
     if (existingAliasMatch?.id) {
       return existingAliasMatch.id;
     }
-    const derivedEndpointId = this.buildNodeDerivedEndpointId(node);
+    const derivedEndpointId = this.buildNodeDerivedEndpointId(resolvedNode);
     const existingById = this.settings.endpoints.find((entry) => entry.id === derivedEndpointId);
     if (existingById?.id) {
       return existingById.id;
     }
 
-    const derivedUrl = this.buildNodeDerivedEndpointUrl(node);
-    const probeEndpoint: EndpointSettings = {
-      id: `${derivedEndpointId}__probe`,
-      execNodes: [node],
-      transport: "websocket",
-      command: "codex",
-      args: [],
-      url: derivedUrl,
-      requestTimeoutMs: 3_000,
-    };
-    const probeClient = new CodexAppServerModeClient(probeEndpoint, this.api.logger);
-    let available = false;
-    try {
-      await probeClient.readAccount({ profile: "default" });
-      available = true;
-    } catch (error) {
-      this.api.logger.debug?.(
-        `codex auto-node endpoint probe failed node=${node} url=${derivedUrl}: ${String(error)}`,
-      );
-    } finally {
-      await probeClient.close().catch(() => undefined);
+    const probeHosts = await this.resolveNodeProbeHosts(resolvedNode);
+    let derivedUrl: string | undefined;
+    for (const probeHost of probeHosts) {
+      const candidateUrl = this.buildNodeDerivedEndpointUrl(probeHost);
+      const probeEndpoint: EndpointSettings = {
+        id: `${derivedEndpointId}__probe`,
+        execNodes: [resolvedNode],
+        transport: "websocket",
+        command: "codex",
+        args: [],
+        url: candidateUrl,
+        requestTimeoutMs: 3_000,
+      };
+      const probeClient = new CodexAppServerModeClient(probeEndpoint, this.api.logger);
+      let available = false;
+      try {
+        await probeClient.readAccount({ profile: "default" });
+        available = true;
+      } catch (error) {
+        this.api.logger.debug?.(
+          `codex auto-node endpoint probe failed node=${resolvedNode} host=${probeHost} url=${candidateUrl}: ${String(error)}`,
+        );
+      } finally {
+        await probeClient.close().catch(() => undefined);
+      }
+      if (available) {
+        derivedUrl = candidateUrl;
+        break;
+      }
     }
-    if (!available) {
+    if (!derivedUrl) {
       return undefined;
     }
 
     const derivedEndpoint: EndpointSettings = {
       id: derivedEndpointId,
-      execNodes: [node],
+      execNodes: [...new Set([resolvedNode, ...probeHosts])],
       transport: "websocket",
       command: "codex",
       args: [],
@@ -1901,9 +1921,48 @@ export class CodexPluginController {
     };
     this.settings.endpoints.push(derivedEndpoint);
     this.api.logger.info(
-      `codex auto-node endpoint registered id=${derivedEndpoint.id} node=${node} url=${derivedUrl}`,
+      `codex auto-node endpoint registered id=${derivedEndpoint.id} node=${resolvedNode} url=${derivedUrl}`,
     );
     return derivedEndpoint.id;
+  }
+
+  private async resolveNodeProbeHosts(node: string): Promise<string[]> {
+    const candidates: string[] = [];
+    const pushCandidate = (value?: string | null) => {
+      const trimmed = value?.trim();
+      if (!trimmed) {
+        return;
+      }
+      if (!candidates.some((entry) => entry.toLowerCase() === trimmed.toLowerCase())) {
+        candidates.push(trimmed);
+      }
+    };
+
+    const nodeAddress = await this.lookupNodeAddress(node).catch((error) => {
+      this.api.logger.debug?.(`codex auto-node address lookup failed node=${node}: ${String(error)}`);
+      return undefined;
+    });
+    pushCandidate(nodeAddress);
+    pushCandidate(node);
+    return candidates;
+  }
+
+  private async lookupNodeAddress(node: string): Promise<string | undefined> {
+    const result = await execFileAsync("openclaw", ["nodes", "status", "--json"], {
+      timeout: 5_000,
+      maxBuffer: 1024 * 1024,
+    });
+    const parsed = JSON.parse(result.stdout) as {
+      nodes?: Array<{ nodeId?: string; displayName?: string; remoteIp?: string; connected?: boolean }>;
+    };
+    const normalizedNode = node.trim().toLowerCase();
+    const match = parsed.nodes?.find((entry) => {
+      const nodeId = entry.nodeId?.trim().toLowerCase();
+      const displayName = entry.displayName?.trim().toLowerCase();
+      return nodeId === normalizedNode || displayName === normalizedNode;
+    });
+    const remoteIp = match?.remoteIp?.trim();
+    return remoteIp || undefined;
   }
 
   private buildNodeDerivedEndpointId(node: string): string {
@@ -1940,14 +1999,14 @@ export class CodexPluginController {
 
   private resolveEndpointIdFromExecContext(execContext?: AgentExecContext): string | undefined {
     const host = execContext?.host?.trim().toLowerCase();
-    if (host !== "node") {
-      return undefined;
-    }
     const node = execContext?.node?.trim();
-    if (!node) {
+    if (!this.shouldUseNodeDerivedEndpointResolution(host, node)) {
       return undefined;
     }
-    const normalizedNode = node.toLowerCase();
+    const normalizedNode = node?.trim().toLowerCase();
+    if (!normalizedNode) {
+      return undefined;
+    }
     const exactMatch = this.settings.endpoints.find((entry) => entry.id?.trim().toLowerCase() === normalizedNode);
     if (exactMatch?.id) {
       return exactMatch.id;
@@ -1956,6 +2015,13 @@ export class CodexPluginController {
       (entry.execNodes ?? []).some((alias) => alias.trim().toLowerCase() === normalizedNode),
     );
     return aliasMatch?.id;
+  }
+
+  private shouldUseNodeDerivedEndpointResolution(host?: string, node?: string): boolean {
+    if (!node?.trim()) {
+      return false;
+    }
+    return host === "node" || host === "auto";
   }
 
   private resolveAgentPermissionsMode(
@@ -1975,6 +2041,27 @@ export class CodexPluginController {
       return requested;
     }
     return this.settings.defaultEndpoint;
+  }
+
+  private getEndpointSettings(endpointId?: string): EndpointSettings | undefined {
+    const resolvedEndpointId =
+      endpointId && this.settings.endpoints.some((entry) => entry.id === endpointId)
+        ? endpointId
+        : this.settings.defaultEndpoint;
+    return (
+      this.settings.endpoints.find((entry) => entry.id === resolvedEndpointId) ??
+      this.settings.endpoints[0]
+    );
+  }
+
+  private getConfiguredWorkspaceDirForEndpoint(endpointId?: string): string | undefined {
+    return this.getEndpointSettings(endpointId)?.defaultWorkspaceDir ?? this.settings.defaultWorkspaceDir;
+  }
+
+  private getConfiguredWorkspaceDirForBinding(
+    binding: StoredBinding | StoredPendingBind | null | undefined,
+  ): string | undefined {
+    return this.getConfiguredWorkspaceDirForEndpoint(this.getEndpointIdForBinding(binding));
   }
 
   private readExecContextFromConfig(config: unknown): AgentExecContext | undefined {
@@ -2001,27 +2088,126 @@ export class CodexPluginController {
     return { host, node };
   }
 
+  private readExecContextFromSession(
+    config: unknown,
+    sessionKey: string | undefined,
+  ): AgentExecContext | undefined {
+    const resolvedSessionKey = sessionKey?.trim();
+    if (!resolvedSessionKey || !config || typeof config !== "object" || Array.isArray(config)) {
+      return undefined;
+    }
+    const sessionConfig = (config as { session?: unknown }).session;
+    const storeSetting =
+      sessionConfig && typeof sessionConfig === "object" && !Array.isArray(sessionConfig)
+        ? (sessionConfig as { store?: unknown }).store
+        : undefined;
+    const storePath = resolveStorePath(typeof storeSetting === "string" ? storeSetting : undefined);
+    const entry = loadSessionStore(storePath, { skipCache: true })[resolvedSessionKey];
+    const host = typeof entry?.execHost === "string" ? entry.execHost.trim() : undefined;
+    const node = typeof entry?.execNode === "string" ? entry.execNode.trim() : undefined;
+    if (!host && !node) {
+      return undefined;
+    }
+    return { host, node };
+  }
+
+  private readExecContextFromAgentSessionKey(
+    config: unknown,
+    sessionKey: string | undefined,
+  ): AgentExecContext | undefined {
+    const agentId = sessionKey?.trim().match(/^agent:([^:]+):/)?.[1]?.trim();
+    if (!agentId || !config || typeof config !== "object" || Array.isArray(config)) {
+      return undefined;
+    }
+    const agents = (config as { agents?: unknown }).agents;
+    const list = agents && typeof agents === "object" && !Array.isArray(agents)
+      ? (agents as { list?: unknown }).list
+      : undefined;
+    if (!Array.isArray(list)) {
+      return undefined;
+    }
+    const agent = list.find((entry) => {
+      if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
+        return false;
+      }
+      const id = typeof (entry as { id?: unknown }).id === "string"
+        ? (entry as { id?: string }).id?.trim()
+        : undefined;
+      return id === agentId;
+    });
+    if (!agent || typeof agent !== "object" || Array.isArray(agent)) {
+      return undefined;
+    }
+    const tools = (agent as { tools?: unknown }).tools;
+    if (!tools || typeof tools !== "object" || Array.isArray(tools)) {
+      return undefined;
+    }
+    const exec = (tools as { exec?: unknown }).exec;
+    if (!exec || typeof exec !== "object" || Array.isArray(exec)) {
+      return undefined;
+    }
+    const host = typeof (exec as { host?: unknown }).host === "string"
+      ? (exec as { host?: string }).host?.trim()
+      : undefined;
+    const node = typeof (exec as { node?: unknown }).node === "string"
+      ? (exec as { node?: string }).node?.trim()
+      : undefined;
+    if (!host && !node) {
+      return undefined;
+    }
+    return { host, node };
+  }
+
+  private resolveConversationSessionKey(
+    conversation: ConversationTarget | null | undefined,
+    sessionKey?: string,
+  ): string | undefined {
+    const explicit = sessionKey?.trim();
+    if (explicit) {
+      return explicit;
+    }
+    if (!conversation) {
+      return undefined;
+    }
+    return this.conversationSessionKeys.get(buildConversationKey(conversation));
+  }
+
+  private resolvePreferredExecContext(
+    conversation: ConversationTarget | null | undefined,
+    sessionKey?: string,
+  ): AgentExecContext | undefined {
+    const config = this.getOpenClawConfig();
+    const resolvedSessionKey = this.resolveConversationSessionKey(conversation, sessionKey);
+    return this.readExecContextFromSession(config, resolvedSessionKey)
+      ?? this.readExecContextFromAgentSessionKey(config, resolvedSessionKey)
+      ?? this.readExecContextFromConfig(config);
+  }
+
   private getManualEndpointId(conversation: ConversationTarget | null | undefined): string | undefined {
     if (!conversation) {
       return undefined;
     }
-    const stored = this.store.getConversationEndpoint(conversation)?.endpointId?.trim();
-    if (stored && this.settings.endpoints.some((entry) => entry.id === stored)) {
-      return stored;
-    }
-    return undefined;
+    const prefixedConversation = !conversation.conversationId.includes(":")
+      ? { ...conversation, conversationId: `${conversation.channel}:${conversation.conversationId}` }
+      : null;
+    return (
+      this.store.getConversationEndpoint(conversation)
+      ?? (prefixedConversation ? this.store.getConversationEndpoint(prefixedConversation) : null)
+    )?.endpointId?.trim() || undefined;
   }
 
-  private getSelectedEndpointId(
+  private async getSelectedEndpointId(
     conversation: ConversationTarget | null | undefined,
     _binding?: StoredBinding | StoredPendingBind | null,
-  ): string {
-    return this.getSelectedEndpointResolution(conversation).endpointId;
+    sessionKey?: string,
+  ): Promise<string> {
+    return (await this.getSelectedEndpointResolution(conversation, sessionKey)).endpointId;
   }
 
-  private getSelectedEndpointResolution(
+  private async getSelectedEndpointResolution(
     conversation: ConversationTarget | null | undefined,
-  ): EndpointResolution {
+    sessionKey?: string,
+  ): Promise<EndpointResolution> {
     const manualEndpointId = this.getManualEndpointId(conversation);
     if (manualEndpointId) {
       return {
@@ -2029,11 +2215,53 @@ export class CodexPluginController {
         source: "manual",
       };
     }
-    const execContext = this.readExecContextFromConfig(this.getOpenClawConfig());
+    const execContext = this.resolvePreferredExecContext(conversation, sessionKey);
     const autoEndpointId = this.resolveEndpointIdFromExecContext(execContext);
     if (autoEndpointId) {
       return {
         endpointId: autoEndpointId,
+        source: "auto-node",
+        nodeId: execContext?.node?.trim() || undefined,
+      };
+    }
+    const derivedEndpointId = await this.tryRegisterNodeDerivedEndpoint(execContext);
+    if (derivedEndpointId) {
+      return {
+        endpointId: derivedEndpointId,
+        source: "auto-node",
+        nodeId: execContext?.node?.trim() || undefined,
+      };
+    }
+    return {
+      endpointId: this.settings.defaultEndpoint,
+      source: "default",
+    };
+  }
+
+  private async getSelectedEndpointResolutionWithNodeFallback(
+    conversation: ConversationTarget | null | undefined,
+    sessionKey?: string,
+  ): Promise<EndpointResolution> {
+    const manualEndpointId = this.getManualEndpointId(conversation);
+    if (manualEndpointId) {
+      return {
+        endpointId: manualEndpointId,
+        source: "manual",
+      };
+    }
+    const execContext = this.resolvePreferredExecContext(conversation, sessionKey);
+    const autoEndpointId = this.resolveEndpointIdFromExecContext(execContext);
+    if (autoEndpointId) {
+      return {
+        endpointId: autoEndpointId,
+        source: "auto-node",
+        nodeId: execContext?.node?.trim() || undefined,
+      };
+    }
+    const derivedEndpointId = await this.tryRegisterNodeDerivedEndpoint(execContext);
+    if (derivedEndpointId) {
+      return {
+        endpointId: derivedEndpointId,
         source: "auto-node",
         nodeId: execContext?.node?.trim() || undefined,
       };
@@ -2137,9 +2365,7 @@ export class CodexPluginController {
     if (existing) {
       return existing;
     }
-    const endpoint =
-      this.settings.endpoints.find((entry) => entry.id === resolvedEndpointId) ??
-      this.settings.endpoints[0];
+    const endpoint = this.getEndpointSettings(resolvedEndpointId);
     if (!endpoint) {
       throw new Error("Codex endpoint configuration is missing.");
     }
@@ -2198,7 +2424,11 @@ export class CodexPluginController {
       );
       return null;
     }
-    const threadState = await this.client
+    const endpointSelection = await this.getSelectedEndpointResolutionWithNodeFallback(conversation);
+    const recoveryClient = this.settings.endpoints.some((entry) => entry.id === endpointSelection.endpointId)
+      ? this.getClientForEndpoint(endpointSelection.endpointId)
+      : this.client;
+    const threadState = await recoveryClient
       .readThreadState({
         profile: "default",
         sessionKey: buildPluginSessionKey(threadId),
@@ -2219,6 +2449,7 @@ export class CodexPluginController {
         : "default";
     const recovered = await this.bindConversation(conversation, {
       threadId,
+      endpointId: endpointSelection.endpointId,
       workspaceDir,
       threadTitle: threadState?.threadName?.trim() || undefined,
       permissionsMode,
@@ -2345,6 +2576,39 @@ export class CodexPluginController {
     }
   }
 
+  private resolveBoundConversationScope(conversation: ConversationTarget): {
+    conversation: ConversationTarget;
+    binding: StoredBinding | null;
+  } {
+    const exact = this.store.getBinding(conversation);
+    if (exact) {
+      return { conversation, binding: exact };
+    }
+    const scoped = this.store.listBindingsForConversationScope(conversation);
+    if (scoped.length === 0) {
+      return { conversation, binding: null };
+    }
+    const normalizedThreadConversationId =
+      isDiscordChannel(conversation.channel) && conversation.threadId != null
+        ? normalizeDiscordChannelConversationId(String(conversation.threadId))
+        : undefined;
+    const preferred =
+      (normalizedThreadConversationId
+        ? scoped.find((entry) => entry.conversation.conversationId === normalizedThreadConversationId)
+        : undefined) ?? (scoped.length === 1 ? scoped[0] : null);
+    if (!preferred) {
+      return { conversation, binding: null };
+    }
+    return {
+      conversation: {
+        ...conversation,
+        conversationId: preferred.conversation.conversationId,
+        parentConversationId: preferred.conversation.parentConversationId,
+      },
+      binding: preferred,
+    };
+  }
+
   async handleInboundClaim(event: {
     content: string;
     channel: string;
@@ -2361,10 +2625,12 @@ export class CodexPluginController {
         return { handled: false };
       }
       await this.start();
-      const conversation = toConversationTargetFromInbound(event);
-      if (!conversation) {
+      const inboundConversation = toConversationTargetFromInbound(event);
+      if (!inboundConversation) {
         return { handled: false };
       }
+      const scopedResolution = this.resolveBoundConversationScope(inboundConversation);
+      const conversation = scopedResolution.conversation;
       const input = await buildInboundTurnInput({
         ...event,
         transcribeAudio: async (media) => await this.transcribeInboundAudio(media),
@@ -2415,7 +2681,7 @@ export class CodexPluginController {
           await active.handle.interrupt().catch(() => undefined);
         }
       }
-      const existingBinding = this.store.getBinding(conversation);
+      const existingBinding = scopedResolution.binding ?? this.store.getBinding(conversation);
       const hydratedBinding = existingBinding ? null : await this.hydrateApprovedBinding(conversation);
       const recoveredBinding =
         existingBinding || hydratedBinding?.binding
@@ -2752,6 +3018,10 @@ export class CodexPluginController {
     this.lastRuntimeConfig = ctx.config;
     const bindingApi = asScopedBindingApi(ctx);
     const conversation = toConversationTargetFromCommand(ctx);
+    const commandSessionKey = (ctx as PluginCommandContext & { sessionKey?: string }).sessionKey?.trim() || undefined;
+    if (conversation && commandSessionKey) {
+      this.conversationSessionKeys.set(buildConversationKey(conversation), commandSessionKey);
+    }
     const currentBinding =
       conversation && bindingApi.getCurrentConversationBinding
         ? await bindingApi.getCurrentConversationBinding()
@@ -2776,8 +3046,11 @@ export class CodexPluginController {
 
     switch (commandName) {
       case "cas_resume": {
-        const resolvedEndpointText = conversation
-          ? `Resolved endpoint: ${this.formatEndpointResolutionLabel(this.getSelectedEndpointResolution(conversation))}`
+        const resolvedEndpoint = conversation
+          ? await this.getSelectedEndpointResolutionWithNodeFallback(conversation, commandSessionKey)
+          : undefined;
+        const resolvedEndpointText = resolvedEndpoint
+          ? `Resolved endpoint: ${this.formatEndpointResolutionLabel(resolvedEndpoint)}`
           : undefined;
         const withResolvedEndpoint = (reply: ReplyPayload): ReplyPayload => {
           if (!resolvedEndpointText) {
@@ -2831,6 +3104,7 @@ export class CodexPluginController {
           binding,
           args,
           Boolean(currentBinding || binding),
+          commandSessionKey,
         );
       case "cas_stop":
         return await this.handleStopCommand(conversation);
@@ -2851,15 +3125,16 @@ export class CodexPluginController {
       case "cas_fast":
         return await this.handleFastCommand(binding, args);
       case "cas_model":
-        return await this.handleModelCommand(conversation, binding, args);
+        return await this.handleModelCommand(conversation, binding, args, commandSessionKey);
       case "cas_endpoints":
       case "cas_endpoint":
-        return await this.handleEndpointCommand(conversation, binding, args);
+        return await this.handleEndpointCommand(conversation, binding, args, commandSessionKey);
       case "cas_permissions":
         return await this.handlePermissionsCommand(
           conversation,
           binding,
           Boolean(currentBinding || binding),
+          commandSessionKey,
         );
       case "cas_init":
         return await this.handlePromptAlias(conversation, binding, args, "/init");
@@ -2983,7 +3258,12 @@ export class CodexPluginController {
     if (parsed.error) {
       return { text: parsed.error };
     }
-    const selectedEndpointId = this.getSelectedEndpointId(conversation, binding);
+    const commandSessionKey = (ctx as PluginCommandContext & { sessionKey?: string }).sessionKey?.trim() || undefined;
+    const selectedEndpoint = await this.getSelectedEndpointResolutionWithNodeFallback(
+      conversation,
+      commandSessionKey,
+    );
+    const selectedEndpointId = selectedEndpoint.endpointId;
     const resumeBinding =
       binding && this.getEndpointIdForBinding(binding) === selectedEndpointId ? binding : null;
     const resumePendingBind =
@@ -3136,6 +3416,7 @@ export class CodexPluginController {
         workspaceDir ||
         resolveWorkspaceDir({
           bindingWorkspaceDir: resumeBinding?.workspaceDir,
+          endpointWorkspaceDir: this.getConfiguredWorkspaceDirForEndpoint(selectedEndpointId),
           configuredWorkspaceDir: this.settings.defaultWorkspaceDir,
           serviceWorkspaceDir: this.serviceWorkspaceDir,
       }),
@@ -3170,6 +3451,7 @@ export class CodexPluginController {
     binding: StoredBinding | null,
     args: string,
     bindingActive: boolean,
+    sessionKey?: string,
   ): Promise<ReplyPayload> {
     const parsed = parseStatusArgs(args);
     if (parsed.error) {
@@ -3201,7 +3483,7 @@ export class CodexPluginController {
       );
       if (targetPermissionsMode === "full-access" && !this.hasFullAccessProfile(binding)) {
         note = buildPermissionsUnavailableNote();
-        const card = await this.buildStatusCard(conversation, binding, bindingActive);
+        const card = await this.buildStatusCard(conversation, binding, bindingActive, sessionKey);
         const text = `${card.text}\n\n${note}`;
         if (!card.buttons || !conversation) {
           return { text };
@@ -3241,7 +3523,7 @@ export class CodexPluginController {
         note = buildPendingPermissionsMigrationNote(targetPermissionsMode);
       }
     }
-    const card = await this.buildStatusCard(conversation, binding, bindingActive);
+    const card = await this.buildStatusCard(conversation, binding, bindingActive, sessionKey);
     const text = note ? `${card.text}\n\n${note}` : card.text;
     if (!card.buttons || !conversation) {
       return { text };
@@ -3686,7 +3968,7 @@ export class CodexPluginController {
       statusMessage?: InteractiveMessageRef;
     },
   ): Promise<PickerRender> {
-    const selection = this.getSelectedEndpointResolution(conversation);
+    const selection = await this.getSelectedEndpointResolution(conversation);
     const manualEndpointId = this.getManualEndpointId(conversation);
     const buttons: PluginInteractiveButtons = [];
     if (manualEndpointId) {
@@ -3823,8 +4105,9 @@ export class CodexPluginController {
     conversation: ConversationTarget | null,
     binding: StoredBinding | null,
     bindingActive: boolean,
+    sessionKey?: string,
   ): Promise<StatusCardRender> {
-    const text = await this.buildStatusText(conversation, binding, bindingActive);
+    const text = await this.buildStatusText(conversation, binding, bindingActive, sessionKey);
     if (!conversation || !binding || !bindingActive) {
       return { text };
     }
@@ -3845,6 +4128,7 @@ export class CodexPluginController {
   ): Promise<PickerRender> {
     const workspaceDir = resolveWorkspaceDir({
       bindingWorkspaceDir: binding?.workspaceDir,
+      endpointWorkspaceDir: this.getConfiguredWorkspaceDirForBinding(binding),
       configuredWorkspaceDir: this.settings.defaultWorkspaceDir,
       serviceWorkspaceDir: this.serviceWorkspaceDir,
     });
@@ -4019,6 +4303,7 @@ export class CodexPluginController {
     }
     const workspaceDir = resolveWorkspaceDir({
       bindingWorkspaceDir: binding?.workspaceDir,
+      endpointWorkspaceDir: this.getConfiguredWorkspaceDirForBinding(binding),
       configuredWorkspaceDir: this.settings.defaultWorkspaceDir,
       serviceWorkspaceDir: this.serviceWorkspaceDir,
     });
@@ -4156,6 +4441,7 @@ export class CodexPluginController {
   ): Promise<ReplyPayload> {
     const workspaceDir = resolveWorkspaceDir({
       bindingWorkspaceDir: binding?.workspaceDir,
+      endpointWorkspaceDir: this.getConfiguredWorkspaceDirForBinding(binding),
       configuredWorkspaceDir: this.settings.defaultWorkspaceDir,
       serviceWorkspaceDir: this.serviceWorkspaceDir,
     });
@@ -4267,12 +4553,13 @@ export class CodexPluginController {
     conversation: ConversationTarget | null,
     binding: StoredBinding | null,
     args: string,
+    sessionKey?: string,
   ): Promise<ReplyPayload> {
     const trimmedArgs = args.trim();
     const profile = this.getPermissionsMode(binding);
     if (!binding) {
       const models = await this.getClientForEndpoint(
-        this.getSelectedEndpointId(conversation, binding),
+        await this.getSelectedEndpointId(conversation, binding, sessionKey),
       ).listModels({ profile });
       return { text: formatModels(models) };
     }
@@ -4340,50 +4627,63 @@ export class CodexPluginController {
     conversation: ConversationTarget | null,
     binding: StoredBinding | null,
     args: string,
+    sessionKey?: string,
   ): Promise<ReplyPayload> {
     if (!conversation) {
       return { text: "This command needs a Telegram or Discord conversation." };
     }
-    const parsed = parseEndpointArgs(args);
-    if (parsed.error) {
-      return { text: parsed.error };
-    }
-    const currentSelection = this.getSelectedEndpointResolution(conversation);
-    if (!parsed.endpointId) {
-      const picker = await this.buildEndpointPicker(conversation, binding);
-      return buildReplyWithButtons(picker.text, picker.buttons);
-    }
-    const requested = parsed.endpointId.trim();
-    if (["auto", "clear"].includes(requested.toLowerCase())) {
-      await this.clearSelectedEndpointId(conversation);
-      const nextSelection = this.getSelectedEndpointResolution(conversation);
+    try {
+      const parsed = parseEndpointArgs(args);
+      if (parsed.error) {
+        return { text: parsed.error };
+      }
+      const currentSelection = await this.getSelectedEndpointResolution(conversation, sessionKey);
+      if (!parsed.endpointId) {
+        const picker = await this.buildEndpointPicker(conversation, binding);
+        return buildReplyWithButtons(picker.text, picker.buttons);
+      }
+      const requested = parsed.endpointId.trim();
+      if (["auto", "clear"].includes(requested.toLowerCase())) {
+        await this.clearSelectedEndpointId(conversation);
+        const nextSelection = await this.getSelectedEndpointResolution(conversation, sessionKey);
+        return { text: this.buildEndpointSelectionNotice(nextSelection, binding, conversation) };
+      }
+      const endpoint = this.settings.endpoints.find((entry) => entry.id === requested);
+      if (!endpoint) {
+        return {
+          text: [
+            `Unknown endpoint: ${requested}`,
+            "",
+            this.formatEndpointListText({
+              conversation,
+              selection: currentSelection,
+              binding,
+            }),
+          ].join("\n"),
+        };
+      }
+      await this.setSelectedEndpointId(conversation, endpoint.id || requested);
+      const nextSelection = await this.getSelectedEndpointResolution(conversation, sessionKey);
       return { text: this.buildEndpointSelectionNotice(nextSelection, binding, conversation) };
-    }
-    const endpoint = this.settings.endpoints.find((entry) => entry.id === requested);
-    if (!endpoint) {
+    } catch (error) {
+      const detail = error instanceof Error ? error.stack ?? error.message : String(error);
+      this.api.logger.warn(
+        `codex endpoint command failed conversation=${conversation.conversationId} sessionKey=${sessionKey ?? "<none>"}: ${detail}`,
+      );
       return {
-        text: [
-          `Unknown endpoint: ${requested}`,
-          "",
-          this.formatEndpointListText({
-            conversation,
-            selection: currentSelection,
-            binding,
-          }),
-        ].join("\n"),
+        text:
+          "cas_endpoint failed internally. Check gateway logs for `codex endpoint command failed` and retry.",
       };
     }
-    await this.setSelectedEndpointId(conversation, endpoint.id || requested);
-    const nextSelection = this.getSelectedEndpointResolution(conversation);
-    return { text: this.buildEndpointSelectionNotice(nextSelection, binding, conversation) };
   }
 
   private async handlePermissionsCommand(
     conversation: ConversationTarget | null,
     binding: StoredBinding | null,
     bindingActive: boolean,
+    sessionKey?: string,
   ): Promise<ReplyPayload> {
-    return await this.handleStatusCommand(conversation, binding, "", bindingActive);
+    return await this.handleStatusCommand(conversation, binding, "", bindingActive, sessionKey);
   }
 
   private async handlePromptAlias(
@@ -4397,6 +4697,7 @@ export class CodexPluginController {
     }
     const workspaceDir = resolveWorkspaceDir({
       bindingWorkspaceDir: binding?.workspaceDir,
+      endpointWorkspaceDir: this.getConfiguredWorkspaceDirForBinding(binding),
       configuredWorkspaceDir: this.settings.defaultWorkspaceDir,
       serviceWorkspaceDir: this.serviceWorkspaceDir,
     });
@@ -4606,6 +4907,7 @@ export class CodexPluginController {
       undefined,
       params.binding,
       this.settings.defaultModel,
+      this.settings.defaultReasoningEffort,
     );
     const run = this.getClientForBinding(params.binding).startTurn({
       profile,
@@ -4858,6 +5160,7 @@ export class CodexPluginController {
       threadState ?? undefined,
       params.binding,
       this.settings.defaultModel,
+      this.settings.defaultReasoningEffort,
     );
     const effectiveThreadState = desired.effectiveState;
     const run = this.getClientForBinding(params.binding).startTurn({
@@ -5048,6 +5351,7 @@ export class CodexPluginController {
       threadState ?? undefined,
       params.binding,
       this.settings.defaultModel,
+      this.settings.defaultReasoningEffort,
     );
     const run = this.getClientForBinding(params.binding).startReview({
       profile,
@@ -5412,6 +5716,7 @@ export class CodexPluginController {
     }
     return resolveWorkspaceDir({
       bindingWorkspaceDir: binding?.workspaceDir,
+      endpointWorkspaceDir: this.getConfiguredWorkspaceDirForBinding(binding),
       configuredWorkspaceDir: this.settings.defaultWorkspaceDir,
       serviceWorkspaceDir: this.serviceWorkspaceDir,
     });
@@ -6345,7 +6650,7 @@ export class CodexPluginController {
         await responders.clear().catch(() => undefined);
       }
       const currentBinding = this.store.getBinding(callback.conversation);
-      const selectedEndpointId = callback.endpointId ?? this.getSelectedEndpointId(callback.conversation, currentBinding);
+      const selectedEndpointId = callback.endpointId ?? await this.getSelectedEndpointId(callback.conversation, currentBinding);
       const profile = this.resolveRequestedPermissionsMode(
         this.getPermissionsMode(currentBinding),
         callback.requestedYolo,
@@ -6540,6 +6845,7 @@ export class CodexPluginController {
       };
       const workspaceDir = callback.workspaceDir?.trim() || binding?.workspaceDir || resolveWorkspaceDir({
         bindingWorkspaceDir: binding?.workspaceDir,
+        endpointWorkspaceDir: this.getConfiguredWorkspaceDirForBinding(binding),
         configuredWorkspaceDir: this.settings.defaultWorkspaceDir,
         serviceWorkspaceDir: this.serviceWorkspaceDir,
       });
@@ -6908,6 +7214,7 @@ export class CodexPluginController {
         binding?.workspaceDir ||
         resolveWorkspaceDir({
           bindingWorkspaceDir: binding?.workspaceDir,
+          endpointWorkspaceDir: this.getConfiguredWorkspaceDirForBinding(binding),
           configuredWorkspaceDir: this.settings.defaultWorkspaceDir,
           serviceWorkspaceDir: this.serviceWorkspaceDir,
         });
@@ -6992,7 +7299,7 @@ export class CodexPluginController {
             : Promise.resolve({
                 text: this.formatEndpointListText({
                   conversation,
-                  selection: this.getSelectedEndpointResolution(conversation),
+                  selection: await this.getSelectedEndpointResolution(conversation),
                   binding,
                 }),
                 buttons: undefined,
@@ -7070,7 +7377,7 @@ export class CodexPluginController {
       await this.setSelectedEndpointId(conversation, callback.endpointId);
       const refreshedBinding = this.store.getBinding(callback.conversation);
       const text = this.buildEndpointSelectionNotice(
-        this.getSelectedEndpointResolution(conversation),
+        await this.getSelectedEndpointResolution(conversation),
         refreshedBinding,
         conversation,
       );
@@ -7120,7 +7427,7 @@ export class CodexPluginController {
       await this.clearSelectedEndpointId(conversation);
       const refreshedBinding = this.store.getBinding(callback.conversation);
       const text = this.buildEndpointSelectionNotice(
-        this.getSelectedEndpointResolution(conversation),
+        await this.getSelectedEndpointResolution(conversation),
         refreshedBinding,
         conversation,
       );
@@ -7356,7 +7663,7 @@ export class CodexPluginController {
       this.getPermissionsMode(binding),
       overrides.requestedYolo,
     );
-    const resolvedEndpointId = endpointId ?? this.getSelectedEndpointId(conversation, binding);
+    const resolvedEndpointId = endpointId ?? await this.getSelectedEndpointId(conversation, binding);
     const created = await this.getClientForEndpoint(resolvedEndpointId).startThread({
       profile,
       sessionKey: binding?.sessionKey,
@@ -7833,8 +8140,9 @@ export class CodexPluginController {
     conversation: ConversationTarget | null,
     binding: StoredBinding | null,
     bindingActive: boolean,
+    sessionKey?: string,
   ): Promise<string> {
-    const selection = this.getSelectedEndpointResolution(conversation);
+    const selection = await this.getSelectedEndpointResolution(conversation, sessionKey);
     const selectedEndpointId = selection.endpointId;
     const activeRun =
       bindingActive && conversation
@@ -7844,6 +8152,7 @@ export class CodexPluginController {
     const pendingProfile = getBindingPendingPermissionsMode(binding);
     const workspaceDir = resolveWorkspaceDir({
       bindingWorkspaceDir: binding?.workspaceDir,
+      endpointWorkspaceDir: this.getConfiguredWorkspaceDirForBinding(binding),
       configuredWorkspaceDir: this.settings.defaultWorkspaceDir,
       serviceWorkspaceDir: this.serviceWorkspaceDir,
     });
