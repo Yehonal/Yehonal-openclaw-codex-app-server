@@ -295,6 +295,134 @@ describe("CodexAppServerClient.setThreadPermissions", () => {
   });
 });
 
+describe("CodexAppServerClient.startTurn", () => {
+  it("creates a replacement thread when a bound thread is missing", async () => {
+    const request = vi.fn(async (method: string, payload: any) => {
+      if (method === "thread/resume" && payload.threadId === "thread-old") {
+        throw new Error("codex app server rpc error (-32600): thread not found: thread-old");
+      }
+      if (method === "thread/resume" && payload.threadId === "thread-new") {
+        throw new Error("codex app server rpc error (-32600): no rollout found for thread id thread-new");
+      }
+      if (method === "thread/start") {
+        return {
+          threadId: "thread-new",
+          model: "gpt-5.4",
+          cwd: "/repo/openclaw",
+        };
+      }
+      if (method === "turn/start") {
+        return {
+          threadId: payload.threadId,
+          runId: "turn-new",
+        };
+      }
+      return {
+        threadId: payload.threadId,
+        model: "gpt-5.4",
+        cwd: "/repo/openclaw",
+      };
+    });
+    const client = new CodexAppServerClient(
+      {
+        enabled: true,
+        transport: "stdio",
+        command: "codex",
+        args: [],
+        requestTimeoutMs: 1_000,
+      },
+      {
+        debug: vi.fn(),
+        info: vi.fn(),
+        warn: vi.fn(),
+        error: vi.fn(),
+      },
+    );
+    (client as any).ensureConnected = vi.fn(async () => ({
+      client: {
+        connect: vi.fn(),
+        close: vi.fn(),
+        notify: vi.fn(),
+        request,
+        setNotificationHandler: vi.fn(),
+        setRequestHandler: vi.fn(),
+      },
+      initializeResult: {},
+    }));
+
+    const run = client.startTurn({
+      sessionKey: "session-123",
+      prompt: "continue",
+      workspaceDir: "/repo/openclaw",
+      runId: "run-1",
+      existingThreadId: "thread-old",
+      model: "gpt-5.4",
+      approvalPolicy: "never",
+      sandbox: "danger-full-access",
+    });
+
+    for (let i = 0; i < 20; i += 1) {
+      if (request.mock.calls.some(([method]) => method === "turn/start")) {
+        break;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    }
+    await (client as any).dispatchNotification("turn/completed", {
+      threadId: "thread-new",
+      runId: "turn-new",
+    });
+
+    await expect(run.result).resolves.toMatchObject({
+      threadId: "thread-new",
+    });
+    expect(request).toHaveBeenCalledWith(
+      "thread/resume",
+      {
+        threadId: "thread-old",
+        persistExtendedHistory: false,
+        model: "gpt-5.4",
+        approvalPolicy: "never",
+        sandbox: "danger-full-access",
+      },
+      1_000,
+    );
+    expect(request).toHaveBeenCalledWith(
+      "thread/start",
+      {
+        cwd: "/repo/openclaw",
+        model: "gpt-5.4",
+      },
+      1_000,
+    );
+    expect(request).toHaveBeenCalledWith(
+      "thread/resume",
+      {
+        threadId: "thread-new",
+        persistExtendedHistory: false,
+        approvalPolicy: "never",
+        sandbox: "danger-full-access",
+      },
+      1_000,
+    );
+    expect(request).toHaveBeenCalledWith(
+      "turn/start",
+      {
+        threadId: "thread-new",
+        input: [{ type: "text", text: "continue" }],
+        model: "gpt-5.4",
+        collaborationMode: {
+          mode: "default",
+          settings: {
+            model: "gpt-5.4",
+            developerInstructions: null,
+          },
+        },
+      },
+      1_000,
+    );
+  });
+});
+
 describe("CodexAppServerClient.startReview", () => {
   it("reapplies saved thread settings before starting review", async () => {
     const request = vi.fn(async (method: string) => {

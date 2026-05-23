@@ -2317,6 +2317,70 @@ function resolveTurnStoppedReason(params: {
   return undefined;
 }
 
+function collectTopLevelKeys(value: unknown): string[] {
+  const record = asRecord(value);
+  return record ? Object.keys(record).sort() : [];
+}
+
+function collectNestedKeys(value: unknown, keys: readonly string[]): Record<string, string[]> {
+  const record = asRecord(value);
+  if (!record) {
+    return {};
+  }
+  const result: Record<string, string[]> = {};
+  for (const key of keys) {
+    const nestedKeys = collectTopLevelKeys(record[key]);
+    if (nestedKeys.length > 0) {
+      result[key] = nestedKeys;
+    }
+  }
+  return result;
+}
+
+function collectStringLengths(value: unknown, maxEntries = 12): Record<string, number> {
+  const result: Record<string, number> = {};
+  const visit = (current: unknown, path: string, depth: number) => {
+    if (Object.keys(result).length >= maxEntries || depth > 3) {
+      return;
+    }
+    if (typeof current === "string") {
+      result[path || "<root>"] = current.length;
+      return;
+    }
+    const record = asRecord(current);
+    if (!record) {
+      return;
+    }
+    for (const [key, nestedValue] of Object.entries(record)) {
+      visit(nestedValue, path ? `${path}.${key}` : key, depth + 1);
+      if (Object.keys(result).length >= maxEntries) {
+        return;
+      }
+    }
+  };
+  visit(value, "", 0);
+  return result;
+}
+
+function summarizeUnhandledNotification(params: {
+  methodLower: string;
+  notificationParams: unknown;
+  ids: ReturnType<typeof extractIds>;
+}): string {
+  return JSON.stringify({
+    method: params.methodLower,
+    ids: {
+      threadId: params.ids.threadId,
+      runId: params.ids.runId,
+      itemId: params.ids.itemId,
+      requestId: params.ids.requestId,
+    },
+    payloadKeys: collectTopLevelKeys(params.notificationParams),
+    nestedKeys: collectNestedKeys(params.notificationParams, ["item", "turn", "data", "payload", "response"]),
+    stringLengths: collectStringLengths(params.notificationParams),
+  });
+}
+
 type PendingInputQueueEntry = {
   state: PendingInputState;
   options: string[];
@@ -3291,6 +3355,7 @@ export class CodexAppServerClient {
     let terminalError: TurnTerminalError | undefined;
     let approvalCancelled = false;
     let notificationQueue = Promise.resolve();
+    const loggedUnhandledNotificationMethods = new Set<string>();
     const pendingInputCoordinator = createPendingInputCoordinator({
       onPendingInput: params.onPendingInput,
       onActivated: () => {
@@ -3413,6 +3478,17 @@ export class CodexAppServerClient {
             `codex turn terminal notification run=${params.runId} thread=${threadId || "<pending>"} turn=${turnId || "<pending>"} method=${methodLower}`,
           );
           completeTurn?.();
+          return;
+        }
+        if (!loggedUnhandledNotificationMethods.has(methodLower)) {
+          loggedUnhandledNotificationMethods.add(methodLower);
+          this.logger.info(
+            `codex unhandled app-server notification run=${params.runId} thread=${threadId || "<pending>"} turn=${turnId || "<pending>"} ${summarizeUnhandledNotification({
+              methodLower,
+              notificationParams,
+              ids,
+            })}`,
+          );
         }
       });
       notificationQueue = next.catch((error: unknown) => {
@@ -3511,7 +3587,7 @@ export class CodexAppServerClient {
         this.logger.debug(
           `codex turn using shared app-server client run=${params.runId} session=${params.sessionKey ?? "<none>"}`,
         );
-        if (!threadId) {
+        const createThread = async (reason: "new" | "missing-thread-recovery") => {
           const created = await requestWithFallbacks({
             client,
             methods: ["thread/start", "thread/new"],
@@ -3530,7 +3606,7 @@ export class CodexAppServerClient {
             throw new Error("Codex App Server did not return a thread id.");
           }
           this.logger.debug(
-            `codex turn thread created run=${params.runId} thread=${threadId} model=${threadModel || "<none>"} reasoningEffort=${threadReasoningEffort || "<none>"}`,
+            `codex turn thread created run=${params.runId} thread=${threadId} reason=${reason} model=${threadModel || "<none>"} reasoningEffort=${threadReasoningEffort || "<none>"}`,
           );
           if (params.serviceTier || params.approvalPolicy || params.sandbox) {
             const resumed = await requestWithFallbacks({
@@ -3543,13 +3619,28 @@ export class CodexAppServerClient {
                 sandbox: params.sandbox,
               }),
               timeoutMs: this.settings.requestTimeoutMs,
+            }).catch((error) => {
+              if (!isMissingThreadError(error)) {
+                throw error;
+              }
+              this.logger.warn(
+                `codex turn created thread settings deferred run=${params.runId} thread=${threadId}: ${String(error)}`,
+              );
+              return undefined;
             });
-            const resumedState = extractThreadState(resumed);
-            threadModel = resumedState.model?.trim() || threadModel;
-            threadReasoningEffort =
-              resumedState.reasoningEffort?.trim() || threadReasoningEffort;
+            if (resumed) {
+              const resumedState = extractThreadState(resumed);
+              threadModel = resumedState.model?.trim() || threadModel;
+              threadReasoningEffort =
+                resumedState.reasoningEffort?.trim() || threadReasoningEffort;
+            }
           }
+        };
+        if (!threadId) {
+          await createThread("new");
         } else {
+          const requestedThreadId = threadId;
+          let resumeError: unknown;
           const resumed = await requestWithFallbacks({
             client,
             methods: ["thread/resume"],
@@ -3561,7 +3652,21 @@ export class CodexAppServerClient {
               sandbox: params.sandbox,
             }),
             timeoutMs: this.settings.requestTimeoutMs,
-          }).catch(() => undefined);
+          }).catch((error) => {
+            resumeError = error;
+            return undefined;
+          });
+          if (resumeError && isMissingThreadError(resumeError)) {
+            this.logger.warn(
+              `codex turn bound thread missing; creating replacement run=${params.runId} missingThread=${requestedThreadId}: ${String(resumeError)}`,
+            );
+            threadId = "";
+            await createThread("missing-thread-recovery");
+          } else if (resumeError) {
+            this.logger.debug(
+              `codex turn thread resume failed; continuing with existing thread run=${params.runId} thread=${threadId}: ${String(resumeError)}`,
+            );
+          }
           const resumedState = resumed ? extractThreadState(resumed) : undefined;
           threadModel = resumedState?.model?.trim() || threadModel;
           threadReasoningEffort =
