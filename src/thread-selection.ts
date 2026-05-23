@@ -46,6 +46,10 @@ export function parseThreadSelectionArgs(args: string): ParsedThreadSelectionArg
 
   for (let index = 0; index < tokens.length; index += 1) {
     const token = tokens[index];
+    if (index === 0 && token === "new") {
+      startNew = true;
+      continue;
+    }
     if (token === "--all" || token === "-a") {
       includeAll = true;
       continue;

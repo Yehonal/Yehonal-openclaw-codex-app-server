@@ -88,6 +88,28 @@ describe("thread selection args", () => {
     });
   });
 
+  it("parses leading new as a direct start-new alias", () => {
+    expect(parseThreadSelectionArgs("new ~/github/openclaw")).toEqual({
+      includeAll: false,
+      listProjects: false,
+      startNew: true,
+      syncTopic: false,
+      cwd: undefined,
+      query: "~/github/openclaw",
+    });
+  });
+
+  it("keeps non-leading new in the resume query", () => {
+    expect(parseThreadSelectionArgs("release new flow")).toEqual({
+      includeAll: false,
+      listProjects: false,
+      startNew: false,
+      syncTopic: false,
+      cwd: undefined,
+      query: "release new flow",
+    });
+  });
+
   it("returns the shared usage text when --cwd is missing its value", () => {
     expect(parseThreadSelectionArgs("--cwd")).toEqual({
       includeAll: false,

@@ -16,10 +16,10 @@ type CommandHelpEntry = {
 export const COMMAND_HELP: Record<CommandName, CommandHelpEntry> = {
   cas_resume: {
     summary: COMMAND_SUMMARY.cas_resume,
-    usage: "/cas_resume [--projects|-p] [--new [project]] [--all|-a] [--cwd <path>] [--sync] [--model <name>] [--fast|--no-fast] [--yolo|--no-yolo] [filter]",
+    usage: "/cas_resume [new <workspace>|--new [project]] [--projects|-p] [--all|-a] [--cwd <path>] [--sync] [--model <name>] [--fast|--no-fast] [--yolo|--no-yolo] [filter]",
     flags: [
       { flag: "--projects, --project, -p", description: "Browse projects first, then pick a thread." },
-      { flag: "--new [project]", description: "Start a new thread; optionally pass a project filter or workspace path." },
+      { flag: "new <workspace>, --new [project]", description: "Start a new thread; optionally pass a project filter or workspace path." },
       { flag: "--all, -a", description: "Search recent threads across projects." },
       { flag: "--cwd <path>", description: "Restrict search to one workspace path." },
       { flag: "--sync", description: "Sync the chat/topic name to the selected thread title." },
@@ -32,6 +32,7 @@ export const COMMAND_HELP: Record<CommandName, CommandHelpEntry> = {
       "/cas_resume",
       "/cas_resume --projects",
       "/cas_resume --new openclaw",
+      "/cas_resume new ~/github/openclaw",
       "/cas_resume thread-1 --model openai/gpt-5.4 --fast --yolo",
       "/cas_resume --cwd ~/github/openclaw release-fix",
       "/cas_resume --sync thread-1",

@@ -109,7 +109,7 @@ Pre-release packages are published on matching npm dist-tags instead of `latest`
 ## Typical Workflow
 
 1. Run `/cas_resume` in the conversation you want to bind.
-2. Use the picker buttons, click `New`, or pass a filter like `/cas_resume release-fix`, `/cas_resume --projects`, or `/cas_resume --new openclaw`.
+2. Use the picker buttons, click `New`, or pass a filter like `/cas_resume release-fix`, `/cas_resume --projects`, `/cas_resume --new openclaw`, or `/cas_resume new ~/github/openclaw`.
 3. Optionally set model, fast mode, or permissions while binding with flags like `/cas_resume --model gpt-5.4 --fast --yolo`.
 4. Send normal chat messages once the thread is bound.
 5. Use `/cas_status` to inspect or adjust the binding in place, including model, reasoning, fast mode, permissions, compact, and stop controls.
@@ -155,6 +155,7 @@ The manual `/cas_*` commands still remain useful as the human-facing fallback an
 | `/cas_resume --projects` | Browse projects first. | Opens a project picker, then a thread picker. |
 | `/cas_resume --new` | Start a fresh Codex thread in a project. | Opens a project picker instead of a thread picker. |
 | `/cas_resume --new openclaw` | Start a fresh Codex thread directly in a matching project. | If more than one workspace matches, you get buttons to choose. |
+| `/cas_resume new ~/github/openclaw` | Start a fresh Codex thread directly from a workspace path. | `new` is a direct alias for `--new` when it is the first argument. |
 | `/cas_resume --all` | Search recent threads across projects. | Useful when the thread is not in the current workspace. |
 | `/cas_resume --cwd ~/github/openclaw` | Restrict browsing/search to one workspace. | `--cwd` accepts an absolute path or `~/...`. |
 | `/cas_resume --sync` | Resume and try to sync the chat/topic name to the Codex thread. | You can combine this with other flags. |

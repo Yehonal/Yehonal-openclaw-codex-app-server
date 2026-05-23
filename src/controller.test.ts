@@ -1186,6 +1186,28 @@ describe("Discord controller flows", () => {
     });
   });
 
+  it("starts a new thread for /cas_resume new <workspace>", async () => {
+    const { controller, clientMock } = await createControllerHarness();
+    const requestConversationBinding = vi.fn(async () => ({ status: "bound" as const }));
+
+    const reply = await controller.handleCommand(
+      "cas_resume",
+      buildTelegramCommandContext({
+        args: "new ~/github/openclaw",
+        commandBody: "/cas_resume new ~/github/openclaw",
+        requestConversationBinding,
+      }),
+    );
+
+    expect(reply.text).toContain("Resolved endpoint: default (default)");
+    expect(clientMock.startThread).toHaveBeenCalledWith({
+      profile: "default",
+      sessionKey: undefined,
+      workspaceDir: path.join(os.homedir(), "github/openclaw"),
+      model: undefined,
+    });
+  });
+
   it("rejects resume when the thread worktree path no longer exists on disk", async () => {
     const { controller, clientMock } = await createControllerHarness();
     const missingWorktreePath = "/tmp/worktrees/bold-bartik/repo-name";
