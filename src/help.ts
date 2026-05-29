@@ -37,7 +37,7 @@ export const COMMAND_HELP: Record<CommandName, CommandHelpEntry> = {
       "/cas_resume --cwd ~/github/openclaw release-fix",
       "/cas_resume --sync thread-1",
     ],
-    notes: "Use --new with no filter to open a project picker. Full Access depends on the current Codex Desktop profiles.",
+    notes: "With no filter, opens the recent-thread picker and shows the last Codex thread bound to this chat first when one exists. Use --new with no filter to open a project picker. Full Access depends on the current Codex Desktop profiles.",
   },
   cas_detach: {
     summary: COMMAND_SUMMARY.cas_detach,

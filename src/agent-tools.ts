@@ -56,6 +56,9 @@ function readToolExecContext(ctx: {
   };
 }
 
+const EXPLICIT_ONLY_PREFIX =
+  "Explicit CAS only. Use this tool only when the codex-workers skill is active or the user explicitly asked for CAS/Codex App Server/Codex worker orchestration. Do not use for normal local shell, git, filesystem, memory, or coding work.";
+
 function readInputItems(value: unknown):
   | Array<{ type: "text"; text: string } | { type: "image"; url: string } | { type: "localImage"; path: string }>
   | undefined {
@@ -105,7 +108,7 @@ export function createAgentTools(controller: CodexPluginController) {
   return [
     {
       name: "codex_workers_describe_endpoints",
-      description: "Describe the configured Codex app-server worker endpoints available to OpenClaw.",
+      description: `${EXPLICIT_ONLY_PREFIX} Describe the configured Codex app-server worker endpoints available to OpenClaw.`,
       parameters: Type.Object({}),
       async execute() {
         try {
@@ -120,7 +123,7 @@ export function createAgentTools(controller: CodexPluginController) {
     },
     {
       name: "codex_workers_list_threads",
-      description: "List Codex threads on a worker endpoint. Use this before reusing an existing thread.",
+      description: `${EXPLICIT_ONLY_PREFIX} List Codex threads on a worker endpoint. Use this before reusing an existing thread.`,
       parameters: Type.Object({
         endpointId: Type.Optional(Type.String({ description: "Configured worker endpoint id, such as `context-worker` or `implementation-worker`." })),
         workspaceDir: Type.Optional(Type.String({ description: "Workspace/project directory on the remote worker. Omit to use the endpoint default." })),
@@ -159,7 +162,7 @@ export function createAgentTools(controller: CodexPluginController) {
     },
     {
       name: "codex_workers_run_task",
-      description: "Run a prompt on a Codex worker via app-server, optionally continuing or naming a persistent thread.",
+      description: `${EXPLICIT_ONLY_PREFIX} Run a prompt on a Codex worker via app-server, optionally continuing or naming a persistent thread.`,
       parameters: Type.Object({
         endpointId: Type.Optional(Type.String({ description: "Configured worker endpoint id, such as `context-worker` or `implementation-worker`." })),
         prompt: Type.String({ description: "Prompt to send to the remote Codex worker." }),
@@ -250,7 +253,7 @@ export function createAgentTools(controller: CodexPluginController) {
     },
     {
       name: "codex_workers_read_thread_context",
-      description: "Read the current state and replay summary for a Codex worker thread.",
+      description: `${EXPLICIT_ONLY_PREFIX} Read the current state and replay summary for a Codex worker thread.`,
       parameters: Type.Object({
         endpointId: Type.Optional(Type.String({ description: "Configured worker endpoint id, such as `context-worker` or `implementation-worker`." })),
         threadId: Type.String({ description: "Codex thread id to inspect." }),

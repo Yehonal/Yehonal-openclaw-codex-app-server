@@ -181,6 +181,7 @@ export function formatThreadPickerIntro(params: {
   totalPages: number;
   totalItems: number;
   includeAll: boolean;
+  hasLastThread?: boolean;
   syncTopic?: boolean;
   projectName?: string;
   workspaceDir?: string;
@@ -198,7 +199,12 @@ export function formatThreadPickerIntro(params: {
           : "Showing recent Codex threads.";
   return [
     `${scopeLabel} ${pageLabel}.`,
-    "Legend: 🌿 worktree, ✏️ uncommitted changes, U updated, C created.",
+    [
+      "Legend: 🌿 worktree, ✏️ uncommitted changes",
+      params.hasLastThread ? "Last session for this chat" : undefined,
+      "U updated",
+      "C created.",
+    ].filter(Boolean).join(", "),
     params.syncTopic
       ? "Choosing a thread will also try to sync the current channel/topic name."
       : "",

@@ -98,6 +98,29 @@ function resolveInboundAudioTranscription(
   };
 }
 
+function readEnabledObject(
+  record: Record<string, unknown>,
+  key: string,
+  fallback: boolean,
+): { enabled: boolean } {
+  const nested = asRecord(record[key]);
+  if (Object.keys(nested).length === 0) {
+    return { enabled: fallback };
+  }
+  return { enabled: nested.enabled !== false };
+}
+
+function readAgentToolsConfig(record: Record<string, unknown>): PluginSettings["agentTools"] {
+  const nested = asRecord(record.agentTools);
+  if (Object.keys(nested).length === 0) {
+    return { enabled: true, allowedAgentIds: [] };
+  }
+  return {
+    enabled: nested.enabled !== false,
+    allowedAgentIds: readStringArray(nested, "allowedAgentIds"),
+  };
+}
+
 export function resolvePluginSettings(rawConfig: unknown): PluginSettings {
   const record = asRecord(rawConfig);
   const endpointRecords = Array.isArray(record.endpoints)
@@ -171,6 +194,9 @@ export function resolvePluginSettings(rawConfig: unknown): PluginSettings {
 
   return {
     enabled: record.enabled !== false,
+    allowedAccountIds: readStringArray(record, "allowedAccountIds"),
+    agentTools: readAgentToolsConfig(record),
+    inboundClaim: readEnabledObject(record, "inboundClaim", true),
     defaultEndpoint,
     agentEndpoints,
     endpoints,

@@ -25,6 +25,14 @@ export type EndpointSettings = {
 
 export type PluginSettings = {
   enabled: boolean;
+  allowedAccountIds: string[];
+  agentTools: {
+    enabled: boolean;
+    allowedAgentIds: string[];
+  };
+  inboundClaim: {
+    enabled: boolean;
+  };
   defaultEndpoint: string;
   agentEndpoints: Record<string, string>;
   endpoints: EndpointSettings[];
@@ -281,11 +289,26 @@ export type TurnResult = {
   threadId: string;
   text?: string;
   planArtifact?: CodexPlanArtifact;
+  reasoningSummary?: string;
   aborted?: boolean;
   stoppedReason?: "interrupt" | "cancelled" | "approval";
   terminalStatus?: "completed" | "interrupted" | "failed";
   terminalError?: TurnTerminalError;
   usage?: ContextUsageSnapshot;
+};
+
+export type ReasoningSummaryProgress = {
+  itemId?: string;
+  text: string;
+  mode: "delta" | "snapshot";
+};
+
+export type CodexActivityProgress = {
+  key: string;
+  text: string;
+  method: string;
+  itemId?: string;
+  itemType?: string;
 };
 
 export type StoredBinding = {

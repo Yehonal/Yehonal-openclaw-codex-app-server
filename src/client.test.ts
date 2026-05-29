@@ -624,6 +624,132 @@ describe("extractThreadTokenUsageSnapshot", () => {
   });
 });
 
+describe("extractReasoningSummaryNotification", () => {
+  it("extracts safe reasoning summary deltas", () => {
+    expect(
+      __testing.extractReasoningSummaryNotification("item/reasoning/summaryTextDelta", {
+        threadId: "thread-123",
+        turnId: "turn-123",
+        itemId: "reasoning-1",
+        summaryTextDelta: "Checking the repository state.",
+      }),
+    ).toEqual({
+      mode: "delta",
+      itemId: "reasoning-1",
+      text: "Checking the repository state.",
+    });
+  });
+
+  it("ignores non-summary reasoning deltas", () => {
+    expect(
+      __testing.extractReasoningSummaryNotification("item/reasoning/delta", {
+        itemId: "reasoning-1",
+        delta: "raw hidden reasoning",
+      }),
+    ).toBeNull();
+  });
+
+  it("extracts completed reasoning item summaries", () => {
+    expect(
+      __testing.extractReasoningSummaryNotification("item/completed", {
+        item: {
+          id: "reasoning-1",
+          type: "reasoning",
+          summary: [{ text: "Checked the active CAS event shape." }],
+        },
+      }),
+    ).toEqual({
+      mode: "snapshot",
+      itemId: "reasoning-1",
+      text: "Checked the active CAS event shape.",
+    });
+  });
+
+  it("surfaces reasoning item activity when the summary is empty", () => {
+    expect(
+      __testing.extractReasoningSummaryNotification("item/started", {
+        item: {
+          id: "reasoning-1",
+          type: "reasoning",
+          summary: [],
+        },
+      }),
+    ).toEqual({
+      mode: "snapshot",
+      itemId: "reasoning-1",
+      text: "Codex is reasoning...",
+    });
+  });
+});
+
+describe("extractCodexActivityNotification", () => {
+  it("summarizes command execution item activity", () => {
+    expect(
+      __testing.extractCodexActivityNotification(
+        "item/started",
+        {
+          item: {
+            id: "cmd-1",
+            type: "commandExecution",
+            command: "journalctl -u openclaw-gateway.service --since today",
+            cwd: "/repo/openclaw",
+            status: "inProgress",
+          },
+        },
+        "/repo/openclaw",
+      ),
+    ).toEqual({
+      key: "item/started:commandExecution:cmd-1:command=journalctl -u openclaw-gateway.service --since today status=inProgress cwd=.",
+      method: "item/started",
+      itemId: "cmd-1",
+      itemType: "commandExecution",
+      text: "CAS item started: commandExecution command=journalctl -u openclaw-gateway.service --since today status=inProgress cwd=.",
+    });
+  });
+
+  it("summarizes file change item activity with workspace-relative paths", () => {
+    expect(
+      __testing.extractCodexActivityNotification(
+        "item/completed",
+        {
+          item: {
+            id: "file-1",
+            type: "fileChange",
+            status: "completed",
+            changes: [{ path: "/repo/openclaw/src/client.ts" }],
+          },
+        },
+        "/repo/openclaw",
+      ),
+    ).toEqual({
+      key: "item/completed:fileChange:file-1:files=src/client.ts status=completed",
+      method: "item/completed",
+      itemId: "file-1",
+      itemType: "fileChange",
+      text: "CAS item completed: fileChange files=src/client.ts status=completed",
+    });
+  });
+
+  it("does not expose raw reasoning deltas as activity text", () => {
+    expect(
+      __testing.extractCodexActivityNotification(
+        "item/reasoning/delta",
+        {
+          itemId: "reasoning-1",
+          delta: "raw hidden reasoning",
+        },
+        "/repo/openclaw",
+      ),
+    ).toEqual({
+      key: "item/reasoning/delta:reasoning:reasoning-1:hidden",
+      method: "item/reasoning/delta",
+      itemId: "reasoning-1",
+      itemType: "reasoning",
+      text: "CAS item delta: reasoning",
+    });
+  });
+});
+
 describe("extractFileChangePathsFromReadResult", () => {
   it("formats in-workspace files as relative paths and keeps outside files absolute", () => {
     expect(

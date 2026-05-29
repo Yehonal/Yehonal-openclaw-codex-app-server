@@ -10,6 +10,7 @@ import {
   CALLBACK_TTL_MS,
   PENDING_INPUT_TTL_MS,
   type AccountSummary,
+  type CodexActivityProgress,
   type CollaborationMode,
   type CompactProgress,
   type CompactResult,
@@ -23,6 +24,7 @@ import {
   type PendingInputState,
   type PermissionsMode,
   type RateLimitSummary,
+  type ReasoningSummaryProgress,
   type ReviewResult,
   type ReviewTarget,
   type SkillSummary,
@@ -2028,6 +2030,187 @@ function extractAssistantNotificationText(
   return { mode: "ignore", text: "" };
 }
 
+function extractReasoningSummaryNotification(
+  method: string,
+  params: unknown,
+): ReasoningSummaryProgress | null {
+  const methodLower = method.trim().toLowerCase();
+  const root = asRecord(params);
+  const item = asRecord(root?.item);
+  const itemType = pickString(item ?? {}, ["type"])?.trim().toLowerCase();
+  const isReasoningItemSnapshot =
+    itemType === "reasoning" &&
+    (methodLower === "item/started" || methodLower === "item/completed");
+  const isReasoningSummaryMethod =
+    methodLower.includes("reasoning") && methodLower.includes("summary");
+  if (!isReasoningItemSnapshot && !isReasoningSummaryMethod) {
+    return null;
+  }
+  const text =
+    isReasoningItemSnapshot
+      ? collectStreamingText(item?.summary)
+      : findFirstNestedString(params, [
+          "summaryTextDelta",
+          "summary_text_delta",
+          "summaryDelta",
+          "summary_delta",
+          "summaryText",
+          "summary_text",
+          "summary",
+        ]) ?? "";
+  const trimmed = text.trim();
+  if (!trimmed && !isReasoningItemSnapshot) {
+    return null;
+  }
+  return {
+    mode:
+      methodLower.includes("delta") ||
+      methodLower.includes("textdelta") ||
+      methodLower.includes("summarytextdelta")
+        ? "delta"
+        : "snapshot",
+    text: trimmed || "Codex is reasoning...",
+    itemId: extractAssistantItemId(params),
+  };
+}
+
+function truncateActivityText(text: string, maxChars = 900): string {
+  const normalized = text.replace(/\s+/g, " ").trim();
+  if (normalized.length <= maxChars) {
+    return normalized;
+  }
+  return `${normalized.slice(0, Math.max(1, maxChars - 3)).trimEnd()}...`;
+}
+
+function relativeActivityPath(rawPath: string, workspaceDir: string): string {
+  const normalizedWorkspace = path.resolve(workspaceDir);
+  const normalizedPath = path.resolve(rawPath);
+  const relative = path.relative(normalizedWorkspace, normalizedPath);
+  if (!relative) {
+    return ".";
+  }
+  if (relative && !relative.startsWith("..") && !path.isAbsolute(relative)) {
+    return relative;
+  }
+  return rawPath;
+}
+
+function extractActivityFilePaths(item: Record<string, unknown>, workspaceDir: string): string[] {
+  const changes = Array.isArray(item.changes) ? item.changes : [];
+  return changes
+    .map((entry) => {
+      const change = asRecord(entry);
+      const rawPath = pickString(change ?? {}, ["path", "file", "filePath", "file_path"]);
+      return rawPath ? relativeActivityPath(rawPath, workspaceDir) : undefined;
+    })
+    .filter((entry): entry is string => Boolean(entry));
+}
+
+function extractCodexActivityNotification(
+  method: string,
+  params: unknown,
+  workspaceDir: string,
+): CodexActivityProgress | null {
+  const methodLower = method.trim().toLowerCase();
+  const root = asRecord(params);
+  if (!root || !methodLower.startsWith("item/")) {
+    return null;
+  }
+  const item = asRecord(root.item);
+  const itemType =
+    pickString(item ?? {}, ["type"]) ??
+    methodLower.match(/^item\/([^/]+)\//)?.[1] ??
+    undefined;
+  const itemId =
+    pickString(item ?? {}, ["id", "itemId", "item_id"]) ??
+    pickString(root, ["itemId", "item_id"]);
+  const state = methodLower.endsWith("/delta")
+    ? "delta"
+    : methodLower.endsWith("/outputdelta")
+      ? "output"
+      : methodLower.endsWith("/started")
+        ? "started"
+        : methodLower.endsWith("/completed")
+          ? "completed"
+          : methodLower.split("/").slice(1).join("/");
+  const keyParts = [methodLower, itemType, itemId].filter(Boolean);
+
+  if (methodLower.includes("reasoning") && !methodLower.includes("summary")) {
+    return {
+      key: [...keyParts, "hidden"].join(":"),
+      method: methodLower,
+      itemId,
+      itemType,
+      text: `CAS item ${state}: reasoning`,
+    };
+  }
+
+  let detail = "";
+  if (item) {
+    switch (itemType?.toLowerCase()) {
+      case "commandexecution": {
+        const command = pickString(item, ["command"]);
+        const status = pickString(item, ["status"]);
+        const cwd = pickString(item, ["cwd"]);
+        detail = [
+          command ? `command=${truncateActivityText(command, 420)}` : undefined,
+          status ? `status=${status}` : undefined,
+          cwd ? `cwd=${relativeActivityPath(cwd, workspaceDir)}` : undefined,
+        ]
+          .filter(Boolean)
+          .join(" ");
+        break;
+      }
+      case "filechange": {
+        const paths = extractActivityFilePaths(item, workspaceDir);
+        const status = pickString(item, ["status"]);
+        detail = [
+          paths.length > 0 ? `files=${paths.slice(0, 6).join(", ")}` : undefined,
+          paths.length > 6 ? `+${paths.length - 6} more` : undefined,
+          status ? `status=${status}` : undefined,
+        ]
+          .filter(Boolean)
+          .join(" ");
+        break;
+      }
+      case "agentmessage":
+      case "usermessage":
+      case "plan": {
+        const text = collectStreamingText(item);
+        detail = text ? `text=${truncateActivityText(text, 420)}` : "";
+        break;
+      }
+      case "reasoning": {
+        const summary = collectStreamingText(item.summary);
+        detail = summary ? `summary=${truncateActivityText(summary, 420)}` : "";
+        break;
+      }
+      default: {
+        const text = collectStreamingText(item);
+        detail = text ? `text=${truncateActivityText(text, 420)}` : "";
+        break;
+      }
+    }
+  } else {
+    const text = collectStreamingText(params);
+    detail = text ? `text=${truncateActivityText(text, 700)}` : "";
+  }
+
+  if (!detail && methodLower.includes("outputdelta")) {
+    const output = collectStreamingText(params);
+    detail = output ? `output=${truncateActivityText(output, 700)}` : "";
+  }
+
+  const label = itemType ? `CAS item ${state}: ${itemType}` : `CAS event: ${methodLower}`;
+  return {
+    key: [...keyParts, truncateActivityText(detail, 120)].join(":"),
+    method: methodLower,
+    itemId,
+    itemType,
+    text: detail ? `${label} ${detail}` : label,
+  };
+}
+
 function extractPlanDeltaNotification(value: unknown): { itemId?: string; delta: string } {
   return {
     itemId: extractAssistantItemId(value),
@@ -2362,6 +2545,25 @@ function collectStringLengths(value: unknown, maxEntries = 12): Record<string, n
   return result;
 }
 
+function collectNotificationCategories(value: unknown): Record<string, string> {
+  const root = asRecord(value) ?? {};
+  const item = asRecord(root.item);
+  const turn = asRecord(root.turn);
+  const status = asRecord(root.status);
+  const review = asRecord(root.review);
+  const action = asRecord(root.action);
+  return Object.fromEntries(
+    [
+      ["itemType", pickString(item ?? {}, ["type"])],
+      ["turnStatus", pickString(turn ?? {}, ["status"])],
+      ["statusType", pickString(status ?? {}, ["type"])],
+      ["reviewStatus", pickString(review ?? {}, ["status"])],
+      ["reviewRiskLevel", pickString(review ?? {}, ["riskLevel", "risk_level"])],
+      ["actionType", pickString(action ?? {}, ["type"])],
+    ].filter((entry): entry is [string, string] => Boolean(entry[1])),
+  );
+}
+
 function summarizeUnhandledNotification(params: {
   methodLower: string;
   notificationParams: unknown;
@@ -2377,8 +2579,21 @@ function summarizeUnhandledNotification(params: {
     },
     payloadKeys: collectTopLevelKeys(params.notificationParams),
     nestedKeys: collectNestedKeys(params.notificationParams, ["item", "turn", "data", "payload", "response"]),
+    categories: collectNotificationCategories(params.notificationParams),
     stringLengths: collectStringLengths(params.notificationParams),
   });
+}
+
+function buildUnhandledNotificationLogKey(methodLower: string, params: unknown): string {
+  const categories = collectNotificationCategories(params);
+  return [
+    methodLower,
+    categories.itemType,
+    categories.turnStatus,
+    categories.statusType,
+    categories.reviewStatus,
+    categories.actionType,
+  ].filter(Boolean).join(":");
 }
 
 type PendingInputQueueEntry = {
@@ -3334,6 +3549,8 @@ export class CodexAppServerClient {
     collaborationMode?: CollaborationMode;
     onPendingInput?: (state: PendingInputState | null) => Promise<void> | void;
     onFileEdits?: (text: string) => Promise<void> | void;
+    onActivity?: (progress: CodexActivityProgress) => Promise<void> | void;
+    onReasoningSummary?: (progress: ReasoningSummaryProgress) => Promise<void> | void;
     onInterrupted?: () => Promise<void> | void;
   }): ActiveCodexRun {
     let threadId = params.existingThreadId?.trim() || "";
@@ -3343,6 +3560,8 @@ export class CodexAppServerClient {
     let assistantText = "";
     let sawAssistantOutput = false;
     let assistantItemId = "";
+    let reasoningSummary = "";
+    let reasoningSummaryItemId = "";
     let planExplanation = "";
     let planSteps: Array<{ step: string; status: "pending" | "inProgress" | "completed" }> = [];
     const planDraftByItemId = new Map<string, string>();
@@ -3397,6 +3616,14 @@ export class CodexAppServerClient {
         if (tokenUsage) {
           latestContextUsage = tokenUsage;
         }
+        const activityNotification = extractCodexActivityNotification(
+          methodLower,
+          notificationParams,
+          params.workspaceDir,
+        );
+        if (activityNotification) {
+          await params.onActivity?.(activityNotification);
+        }
         if (methodLower === "item/started") {
           const fileEditSummaries = extractFileEditSummariesFromNotification(
             notificationParams,
@@ -3437,6 +3664,38 @@ export class CodexAppServerClient {
           }
         }
         const assistantNotification = extractAssistantNotificationText(methodLower, notificationParams);
+        const reasoningNotification = extractReasoningSummaryNotification(
+          methodLower,
+          notificationParams,
+        );
+        if (reasoningNotification) {
+          if (
+            reasoningNotification.itemId &&
+            reasoningSummaryItemId &&
+            reasoningNotification.itemId !== reasoningSummaryItemId
+          ) {
+            reasoningSummary = "";
+          }
+          if (reasoningNotification.itemId) {
+            reasoningSummaryItemId = reasoningNotification.itemId;
+          }
+          if (reasoningNotification.mode === "delta") {
+            reasoningSummary =
+              reasoningSummary && reasoningNotification.text.startsWith(reasoningSummary)
+                ? reasoningNotification.text
+                : `${reasoningSummary}${reasoningNotification.text}`;
+          } else {
+            reasoningSummary = reasoningNotification.text.trim();
+          }
+          const displayText = reasoningSummary.trim();
+          if (displayText) {
+            await params.onReasoningSummary?.({
+              ...reasoningNotification,
+              text: displayText,
+            });
+          }
+          return;
+        }
         const assistantPreview = assistantNotification.text.trim();
         if (assistantPreview && !sawAssistantOutput) {
           sawAssistantOutput = true;
@@ -3480,8 +3739,9 @@ export class CodexAppServerClient {
           completeTurn?.();
           return;
         }
-        if (!loggedUnhandledNotificationMethods.has(methodLower)) {
-          loggedUnhandledNotificationMethods.add(methodLower);
+        const unhandledLogKey = buildUnhandledNotificationLogKey(methodLower, notificationParams);
+        if (!loggedUnhandledNotificationMethods.has(unhandledLogKey)) {
+          loggedUnhandledNotificationMethods.add(unhandledLogKey);
           this.logger.info(
             `codex unhandled app-server notification run=${params.runId} thread=${threadId || "<pending>"} turn=${turnId || "<pending>"} ${summarizeUnhandledNotification({
               methodLower,
@@ -3741,6 +4001,7 @@ export class CodexAppServerClient {
                 markdown: finalPlanMarkdown,
               }
             : undefined,
+          reasoningSummary: reasoningSummary.trim() || undefined,
           aborted: stoppedReason === "interrupt" || stoppedReason === "cancelled",
           stoppedReason,
           terminalStatus,
@@ -4020,6 +4281,8 @@ export const __testing = {
   extractStartupProbeInfo,
   formatFileEditNotice,
   extractThreadTokenUsageSnapshot,
+  extractCodexActivityNotification,
+  extractReasoningSummaryNotification,
   extractRateLimitSummaries,
   formatStdioProcessLog,
   resolveTurnStoppedReason,

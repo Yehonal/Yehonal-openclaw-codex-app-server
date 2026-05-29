@@ -61,6 +61,8 @@ import type {
   InteractiveMessageRef,
   PendingInputState,
   PermissionsMode,
+  PluginSettings,
+  ThreadSummary,
   ThreadState,
   TurnResult,
   TurnTerminalError,
@@ -1511,12 +1513,30 @@ function summarizeTextForLog(text: string, maxChars = 120): string {
   return `${normalized.slice(0, Math.max(1, maxChars - 1)).trimEnd()}…`;
 }
 
+function resolvePluginStateDir(api: OpenClawPluginApi): string {
+  const runtimeState = (
+    api as OpenClawPluginApi & {
+      runtime?: { state?: { resolveStateDir?: () => string } };
+    }
+  ).runtime?.state;
+  if (typeof runtimeState?.resolveStateDir === "function") {
+    return runtimeState.resolveStateDir();
+  }
+  const envStateDir = process.env.OPENCLAW_STATE_DIR?.trim();
+  if (envStateDir) {
+    return envStateDir;
+  }
+  const homeDir = process.env.HOME?.trim();
+  return path.join(homeDir || process.cwd(), ".openclaw");
+}
+
 export class CodexPluginController {
-  private readonly settings;
+  private settings: PluginSettings;
   private readonly clients = new Map<string, CodexAppServerModeClient>();
   private readonly activeRuns = new Map<string, ActiveRunRecord>();
   private readonly threadChangesCache = new Map<string, Promise<boolean | undefined>>();
   private readonly conversationSessionKeys = new Map<string, string>();
+  private readonly stateDir: string;
   private readonly store;
   private serviceWorkspaceDir?: string;
   private lastRuntimeConfig?: unknown;
@@ -1524,7 +1544,21 @@ export class CodexPluginController {
 
   constructor(private readonly api: OpenClawPluginApi) {
     this.settings = resolvePluginSettings(this.api.pluginConfig);
-    this.store = new PluginStateStore(this.api.runtime.state.resolveStateDir());
+    this.stateDir = resolvePluginStateDir(this.api);
+    this.store = new PluginStateStore(this.stateDir);
+  }
+
+  private readRuntimePluginConfig(): unknown {
+    const cfg = this.getOpenClawConfig();
+    const root = asRecord(cfg);
+    const plugins = asRecord(root?.plugins);
+    const entries = asRecord(plugins?.entries);
+    const entry = asRecord(entries?.[PLUGIN_ID]);
+    return entry?.config ?? this.api.pluginConfig;
+  }
+
+  private refreshSettingsFromRuntime(): void {
+    this.settings = resolvePluginSettings(this.readRuntimePluginConfig());
   }
 
   createService(): OpenClawPluginService {
@@ -2673,7 +2707,11 @@ export class CodexPluginController {
     metadata?: Record<string, unknown>;
   }): Promise<{ handled: boolean }> {
     try {
+      this.refreshSettingsFromRuntime();
       if (!this.settings.enabled) {
+        return { handled: false };
+      }
+      if (!this.settings.inboundClaim.enabled) {
         return { handled: false };
       }
       await this.start();
@@ -3066,8 +3104,9 @@ export class CodexPluginController {
   }
 
   async handleCommand(commandName: string, ctx: PluginCommandContext): Promise<ReplyPayload> {
-    await this.start();
     this.lastRuntimeConfig = ctx.config;
+    this.refreshSettingsFromRuntime();
+    await this.start();
     const bindingApi = asScopedBindingApi(ctx);
     const conversation = toConversationTargetFromCommand(ctx);
     const commandSessionKey = (ctx as PluginCommandContext & { sessionKey?: string }).sessionKey?.trim() || undefined;
@@ -4962,6 +5001,10 @@ export class CodexPluginController {
       this.settings.defaultModel,
       this.settings.defaultReasoningEffort,
     );
+    let lastReasoningSummaryText = "";
+    let lastReasoningSummarySentAt = 0;
+    const activityMessagesSentAt = new Map<string, number>();
+    let lastActivitySentAt = 0;
     const run = this.getClientForBinding(params.binding).startTurn({
       profile,
       sessionKey: params.binding?.sessionKey,
@@ -4984,6 +5027,46 @@ export class CodexPluginController {
       },
       onFileEdits: async (text) => {
         await this.sendText(params.conversation, text);
+      },
+      onActivity: async (progress) => {
+        const text = progress.text.trim();
+        if (!text) {
+          return;
+        }
+        const now = Date.now();
+        const previousForKey = activityMessagesSentAt.get(progress.key) ?? 0;
+        if (now - previousForKey < 15_000) {
+          return;
+        }
+        if (now - lastActivitySentAt < 1_200) {
+          return;
+        }
+        activityMessagesSentAt.set(progress.key, now);
+        lastActivitySentAt = now;
+        const displayText = text.length > 1_800 ? `${text.slice(0, 1_797).trimEnd()}...` : text;
+        await this.sendText(params.conversation, displayText);
+      },
+      onReasoningSummary: async (progress) => {
+        const text = progress.text.trim();
+        if (!text || text === lastReasoningSummaryText) {
+          return;
+        }
+        const now = Date.now();
+        const first = !lastReasoningSummaryText;
+        const materiallyLonger = text.length >= lastReasoningSummaryText.length + 160;
+        const oldEnough = now - lastReasoningSummarySentAt >= 5_000;
+        if (!first && !materiallyLonger && !oldEnough) {
+          return;
+        }
+        lastReasoningSummaryText = text;
+        lastReasoningSummarySentAt = now;
+        const displayText = text.length > 1_800 ? `${text.slice(0, 1_797).trimEnd()}...` : text;
+        await this.sendText(
+          params.conversation,
+          displayText === "Codex is reasoning..."
+            ? displayText
+            : `Codex reasoning summary:\n${displayText}`,
+        );
       },
       onInterrupted: async () => {
         this.api.logger.debug?.(
@@ -5907,6 +5990,7 @@ export class CodexPluginController {
     threads: Array<{ threadId: string; title?: string; projectKey?: string }>;
     showProjectName: boolean;
     endpointId?: string;
+    lastThreadId?: string;
   }): Promise<PluginInteractiveButtons | undefined> {
     if (params.threads.length === 0) {
       return undefined;
@@ -5929,12 +6013,15 @@ export class CodexPluginController {
       });
       rows.push([
         {
-          text: formatThreadButtonLabel({
-            thread,
-            includeProjectSuffix: params.showProjectName,
-            isWorktree,
-            hasChanges,
-          }),
+          text: [
+            thread.threadId === params.lastThreadId ? "Last:" : undefined,
+            formatThreadButtonLabel({
+              thread,
+              includeProjectSuffix: params.showProjectName,
+              isWorktree,
+              hasChanges,
+            }),
+          ].filter(Boolean).join(" "),
           callback_data: `${INTERACTIVE_NAMESPACE}:${callback.token}`,
         },
       ]);
@@ -6064,6 +6151,35 @@ export class CodexPluginController {
     return params.buttons;
   }
 
+  private prioritizeBoundThreadForPicker(
+    threads: ThreadSummary[],
+    binding: StoredBinding | null,
+    parsed: ReturnType<typeof parseThreadSelectionArgs>,
+    projectName?: string,
+  ): ThreadSummary[] {
+    if (!binding || parsed.query || projectName) {
+      return threads;
+    }
+    const index = threads.findIndex((thread) => thread.threadId === binding.threadId);
+    if (index >= 0) {
+      const current = threads[index];
+      return [
+        current,
+        ...threads.slice(0, index),
+        ...threads.slice(index + 1),
+      ];
+    }
+    return [
+      {
+        threadId: binding.threadId,
+        title: binding.threadTitle,
+        projectKey: binding.workspaceDir,
+        updatedAt: binding.updatedAt,
+      },
+      ...threads,
+    ];
+  }
+
   private async renderThreadPicker(
     conversation: ConversationTarget,
     binding: StoredBinding | null,
@@ -6091,6 +6207,7 @@ export class CodexPluginController {
         fallbackToGlobal = true;
       }
     }
+    threads = this.prioritizeBoundThreadForPicker(threads, binding, parsed, projectName);
     const pageResult = paginateItems(threads, page);
     const distinctProjects = new Set(
       threads.map((thread) => getProjectName(thread.projectKey)).filter(Boolean),
@@ -6102,6 +6219,7 @@ export class CodexPluginController {
       threads: pageResult.items,
       showProjectName: !projectName && (fallbackToGlobal || distinctProjects.size > 1),
       endpointId,
+      lastThreadId: !parsed.query && !projectName ? binding?.threadId : undefined,
       })) ?? [];
     return {
       text: formatThreadPickerIntro({
@@ -6109,6 +6227,7 @@ export class CodexPluginController {
         totalPages: pageResult.totalPages,
         totalItems: pageResult.totalItems,
         includeAll: workspaceDir == null || fallbackToGlobal,
+        hasLastThread: !parsed.query && !projectName && Boolean(binding),
         syncTopic: parsed.syncTopic,
         workspaceDir: fallbackToGlobal ? undefined : workspaceDir,
         projectName,
@@ -8299,7 +8418,7 @@ export class CodexPluginController {
         summaryText: inlineText,
       };
     }
-    const tempDir = path.join(this.api.runtime.state.resolveStateDir(), "tmp");
+    const tempDir = path.join(this.stateDir, "tmp");
     await fs.mkdir(tempDir, { recursive: true, mode: 0o700 });
     const attachmentPath = path.join(
       tempDir,
@@ -8822,7 +8941,7 @@ export class CodexPluginController {
     if (!path.isAbsolute(localPath)) {
       return undefined;
     }
-    const roots = new Set<string>([this.api.runtime.state.resolveStateDir(), path.dirname(localPath)]);
+    const roots = new Set<string>([this.stateDir, path.dirname(localPath)]);
     return [...roots];
   }
 

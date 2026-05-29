@@ -50,6 +50,37 @@ describe("config resolution", () => {
     });
   });
 
+  it("allows disabling ambient agent tools and inbound claims", () => {
+    const settings = resolvePluginSettings({
+      agentTools: { enabled: false },
+      inboundClaim: { enabled: false },
+    });
+
+    expect(settings.agentTools.enabled).toBe(false);
+    expect(settings.agentTools.allowedAgentIds).toEqual([]);
+    expect(settings.inboundClaim.enabled).toBe(false);
+  });
+
+  it("supports limiting agent tools to explicit agent ids", () => {
+    const settings = resolvePluginSettings({
+      agentTools: {
+        allowedAgentIds: [" main ", "", "yehonal-admin"],
+      },
+    });
+
+    expect(settings.agentTools.enabled).toBe(true);
+    expect(settings.agentTools.allowedAgentIds).toEqual(["main", "yehonal-admin"]);
+  });
+
+  it("keeps agent tools and inbound claims enabled by default", () => {
+    const settings = resolvePluginSettings({});
+
+    expect(settings.allowedAccountIds).toEqual([]);
+    expect(settings.agentTools.enabled).toBe(true);
+    expect(settings.agentTools.allowedAgentIds).toEqual([]);
+    expect(settings.inboundClaim.enabled).toBe(true);
+  });
+
   it("prefers requested and binding workspaces before endpoint defaults", () => {
     expect(
       resolveWorkspaceDir({

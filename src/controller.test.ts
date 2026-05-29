@@ -743,6 +743,51 @@ describe("Discord controller flows", () => {
     );
   });
 
+  it("shows the last bound thread first in the /cas_resume picker", async () => {
+    const { controller, clientMock } = await createControllerHarness();
+    await (controller as any).store.upsertBinding({
+      conversation: {
+        channel: "telegram",
+        accountId: "default",
+        conversationId: "123:topic:456",
+        parentConversationId: "123",
+      },
+      sessionKey: "openclaw-codex-app-server:thread:thread-1",
+      threadId: "thread-1",
+      endpointId: "default",
+      workspaceDir: "/repo/openclaw",
+      threadTitle: "Discord Thread",
+      updatedAt: Date.now() - 1000,
+    });
+    clientMock.listThreads = vi.fn(async () => [
+      {
+        threadId: "thread-2",
+        title: "Other Thread",
+        projectKey: "/repo/openclaw",
+        createdAt: Date.now() - 120_000,
+        updatedAt: Date.now() - 60_000,
+      },
+    ]);
+    const requestConversationBinding = vi.fn(async () => ({ status: "bound" as const }));
+
+    const reply = await controller.handleCommand(
+      "cas_resume",
+      buildTelegramCommandContext({
+        commandBody: "/cas_resume",
+        messageThreadId: 456,
+        requestConversationBinding,
+      }),
+    );
+
+    expect(requestConversationBinding).not.toHaveBeenCalled();
+    expect(reply.text).toContain("Showing recent Codex threads");
+    expect(reply.text).toContain("Last session for this chat");
+    const buttons = (reply.channelData as any)?.telegram?.buttons;
+    expect(buttons?.[0]?.[0]?.text).toContain("Last:");
+    expect(buttons?.[0]?.[0]?.text).toContain("Discord Thread");
+    expect(buttons?.[1]?.[0]?.text).toContain("Other Thread");
+  });
+
   it("sends resume pickers through the Discord outbound adapter when the legacy runtime is absent", async () => {
     const { controller, discordOutbound } = await createControllerHarnessWithoutLegacyDiscordRuntime();
 

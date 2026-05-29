@@ -2,12 +2,45 @@
   "id": "openclaw-codex-app-server",
   "name": "OpenClaw Plugin For Codex App Server",
   "description": "Independent OpenClaw plugin for the Codex App Server protocol with bound Telegram and Discord conversations.",
+  "skills": [
+    "./skills"
+  ],
   "configSchema": {
     "type": "object",
     "additionalProperties": false,
     "properties": {
       "enabled": {
         "type": "boolean"
+      },
+      "allowedAccountIds": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        }
+      },
+      "agentTools": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "enabled": {
+            "type": "boolean"
+          },
+          "allowedAgentIds": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        }
+      },
+      "inboundClaim": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "enabled": {
+            "type": "boolean"
+          }
+        }
       },
       "transport": {
         "type": "string",
@@ -159,6 +192,20 @@
     "enabled": {
       "label": "Enabled"
     },
+    "allowedAccountIds": {
+      "label": "Allowed Account IDs",
+      "advanced": true
+    },
+    "agentTools": {
+      "label": "Agent Tools",
+      "advanced": true,
+      "help": "Controls whether this plugin exposes codex_workers_* tools to OpenClaw agents. Use allowedAgentIds to restrict worker tools to specific agents."
+    },
+    "inboundClaim": {
+      "label": "Inbound Claim",
+      "advanced": true,
+      "help": "Controls whether bound Discord/Telegram conversations are claimed automatically and routed into CAS."
+    },
     "transport": {
       "label": "Transport"
     },
@@ -225,5 +272,16 @@
       "advanced": true,
       "help": "Optional preprocessor for inbound audio/voice attachments. The command should print the transcript to stdout. Use {path}, {mimeType}, and {fileName} placeholders in args when needed."
     }
+  },
+  "activation": {
+    "onStartup": true
+  },
+  "contracts": {
+    "tools": [
+      "codex_workers_describe_endpoints",
+      "codex_workers_list_threads",
+      "codex_workers_run_task",
+      "codex_workers_read_thread_context"
+    ]
   }
 }
