@@ -329,6 +329,34 @@ type PickerResponders = {
   detachConversationBinding?: () => Promise<{ removed: boolean }>;
 };
 
+type InboundClaimEvent = {
+  content: string;
+  channel: string;
+  accountId?: string;
+  conversationId?: string;
+  parentConversationId?: string;
+  threadId?: string | number;
+  isGroup?: boolean;
+  media?: PluginInboundMedia[];
+  metadata?: Record<string, unknown>;
+  wasMentioned?: boolean;
+  commandAuthorized?: boolean;
+};
+
+type ExtraMessageRuntimePolicy = {
+  responseMode?: string;
+  ingestMode?: string;
+};
+
+type ExtraMessagePolicyScope = {
+  platform: string;
+  accountId: string;
+  guildId: string;
+  channelId: string;
+  parentChannelId: string;
+  conversationId: string;
+};
+
 const DELAYED_QUESTIONNAIRE_NOTE_THRESHOLD_MS = 15 * 60_000;
 
 function formatElapsedDuration(elapsedMs: number): string {
@@ -662,6 +690,270 @@ function toConversationTargetFromInbound(event: {
     parentConversationId,
     threadId: resolvedThreadId,
   };
+}
+
+function firstString(...values: unknown[]): string {
+  for (const value of values) {
+    if (typeof value === "string" && value.trim()) {
+      return value.trim();
+    }
+    if (typeof value === "number" && Number.isFinite(value)) {
+      return String(Math.trunc(value));
+    }
+  }
+  return "";
+}
+
+function firstBoolean(...values: unknown[]): boolean | undefined {
+  for (const value of values) {
+    if (typeof value === "boolean") {
+      return value;
+    }
+  }
+  return undefined;
+}
+
+function stripConversationPrefix(value: unknown): string {
+  let text = firstString(value);
+  for (let index = 0; index < 4; index += 1) {
+    const next = text.replace(/^(channel|chat|user):/, "");
+    if (next === text) {
+      break;
+    }
+    text = next;
+  }
+  return text;
+}
+
+function isLikelyInboundTextCommand(content: string): boolean {
+  return /^\s*[!/][A-Za-z][\w-]*(?:\s|$)/.test(content);
+}
+
+function normalizeResponseMode(value: unknown, fallback = "off"): "off" | "mention" | "firstTag" | "always" {
+  const normalized = String(value ?? "").trim().toLowerCase();
+  if (normalized === "firsttag" || normalized === "first-tag") {
+    return "firstTag";
+  }
+  if (
+    normalized === "mention"
+    || normalized === "mentions"
+    || normalized === "mention-only"
+    || normalized === "mentiononly"
+  ) {
+    return "mention";
+  }
+  if (normalized === "always" || normalized === "on") {
+    return "always";
+  }
+  if (normalized === "off") {
+    return "off";
+  }
+  return normalizeResponseMode(fallback, "off");
+}
+
+function objectRecord(value: unknown): Record<string, unknown> | null {
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : null;
+}
+
+function extraPolicyPluginConfig(config: unknown): Record<string, unknown> | null {
+  const root = objectRecord(config);
+  const plugins = objectRecord(root?.plugins);
+  const entries = objectRecord(plugins?.entries);
+  const entry = objectRecord(entries?.["extra-message-policy"]);
+  const entryConfig = objectRecord(entry?.config);
+  if (entryConfig) {
+    return entryConfig;
+  }
+  const legacyEntry = objectRecord(plugins?.["extra-message-policy"]);
+  return objectRecord(legacyEntry?.config) ?? legacyEntry;
+}
+
+function extraPolicyStatePath(api: OpenClawPluginApi, policyConfig: Record<string, unknown> | null): string {
+  const policyCommand = objectRecord(policyConfig?.policyCommand);
+  const configuredPath = firstString(policyCommand?.statePath, policyConfig?.statePath);
+  if (configuredPath) {
+    return path.isAbsolute(configuredPath) ? configuredPath : path.resolve(process.cwd(), configuredPath);
+  }
+  try {
+    const stateRuntime = api.runtime.state as {
+      resolveStateDir?: (config?: unknown) => string;
+    };
+    const stateDir = stateRuntime.resolveStateDir?.(api.config);
+    if (stateDir) {
+      return path.join(stateDir, "extra-message-policy", "policy-state.json");
+    }
+  } catch {
+    // Fall through to the same fallback used by the policy plugin.
+  }
+  return path.resolve(process.cwd(), "runtime/extra-message-policy/policy-state.json");
+}
+
+async function loadExtraPolicyState(filePath: string): Promise<Record<string, ExtraMessageRuntimePolicy>> {
+  try {
+    const parsed = JSON.parse(await fs.readFile(filePath, "utf8")) as {
+      scopes?: Record<string, { policy?: ExtraMessageRuntimePolicy } | ExtraMessageRuntimePolicy>;
+    };
+    const scopes: Record<string, ExtraMessageRuntimePolicy> = {};
+    for (const [key, value] of Object.entries(parsed.scopes ?? {})) {
+      const record = objectRecord(value);
+      const policy = objectRecord(record?.policy) ?? record;
+      if (!policy) {
+        continue;
+      }
+      scopes[key] = {
+        responseMode: firstString(policy.responseMode),
+        ingestMode: firstString(policy.ingestMode),
+      };
+    }
+    return scopes;
+  } catch {
+    return {};
+  }
+}
+
+function scopeFromInboundClaim(event: InboundClaimEvent): ExtraMessagePolicyScope | null {
+  if (!isDiscordChannel(event.channel)) {
+    return null;
+  }
+  const metadata = objectRecord(event.metadata) ?? {};
+  const parentChannelId = stripConversationPrefix(
+    firstString(
+      event.parentConversationId,
+      metadata.parentConversationId,
+      metadata.parentChannelId,
+      metadata.parent_channel_id,
+      metadata.parentId,
+      metadata.parent_id,
+      metadata.threadParentId,
+      metadata.thread_parent_id,
+    ),
+  );
+  const directThreadId = stripConversationPrefix(firstString(event.threadId, metadata.threadId, metadata.thread_id));
+  const rawConversationId = stripConversationPrefix(
+    firstString(event.conversationId, metadata.conversationId, metadata.to, metadata.channelId, metadata.channel_id),
+  );
+  const conversationId = directThreadId || rawConversationId;
+  const channelId = parentChannelId || rawConversationId || directThreadId;
+  if (!conversationId && !channelId) {
+    return null;
+  }
+  return {
+    platform: "discord",
+    accountId: firstString(event.accountId, metadata.accountId, metadata.account_id, "default"),
+    guildId: firstString(metadata.guildId, metadata.guild_id, metadata.rawGuildId, metadata.raw_guild_id),
+    channelId,
+    parentChannelId,
+    conversationId,
+  };
+}
+
+function runtimeScopeKey(scope: ExtraMessagePolicyScope, zoneId: string): string {
+  return [scope.platform || "discord", scope.accountId || "default", scope.guildId || "-", zoneId || "-"].join(":");
+}
+
+function findRuntimePolicyForScope(
+  state: Record<string, ExtraMessageRuntimePolicy>,
+  scope: ExtraMessagePolicyScope,
+): ExtraMessageRuntimePolicy | null {
+  const exactZone = scope.conversationId || scope.channelId || "-";
+  const zones = [exactZone];
+  const parentZone = scope.parentChannelId || scope.channelId;
+  if (parentZone && parentZone !== exactZone) {
+    zones.push(parentZone);
+  }
+
+  for (const zoneId of zones) {
+    const exactKey = runtimeScopeKey(scope, zoneId);
+    if (state[exactKey]) {
+      return state[exactKey];
+    }
+    if (scope.guildId) {
+      continue;
+    }
+    const prefix = `${scope.platform || "discord"}:${scope.accountId || "default"}:`;
+    const suffix = `:${zoneId}`;
+    const matches = Object.entries(state).filter(([key]) => key.startsWith(prefix) && key.endsWith(suffix));
+    if (matches.length === 1) {
+      return matches[0][1];
+    }
+  }
+  return null;
+}
+
+function inboundClaimWasMentioned(event: InboundClaimEvent): boolean {
+  const metadata = objectRecord(event.metadata) ?? {};
+  const mention = objectRecord(metadata.mention);
+  const mentions = objectRecord(metadata.mentions);
+  const discord = objectRecord(metadata.discord);
+  const message = objectRecord(metadata.message);
+  return firstBoolean(
+    event.wasMentioned,
+    metadata.wasMentioned,
+    metadata.WasMentioned,
+    metadata.was_mentioned,
+    metadata.mentioned,
+    mention?.wasMentioned,
+    mentions?.wasMentioned,
+    discord?.wasMentioned,
+    message?.wasMentioned,
+  ) === true;
+}
+
+function inboundClaimFirstTokenMentionsBot(event: InboundClaimEvent): boolean {
+  if (!inboundClaimWasMentioned(event)) {
+    return false;
+  }
+  const firstToken = event.content.trim().split(/\s+/, 1)[0] ?? "";
+  return firstToken.startsWith("<@") || firstToken.startsWith("@");
+}
+
+function shouldSuppressForRuntimeResponseMode(
+  responseMode: "off" | "mention" | "firstTag" | "always",
+  event: InboundClaimEvent,
+): boolean {
+  if (responseMode === "always") {
+    return false;
+  }
+  if (responseMode === "off") {
+    return true;
+  }
+  if (responseMode === "firstTag") {
+    return !inboundClaimFirstTokenMentionsBot(event);
+  }
+  return !inboundClaimWasMentioned(event);
+}
+
+async function shouldSilenceInboundClaimForExtraMessagePolicy(
+  api: OpenClawPluginApi,
+  event: InboundClaimEvent,
+): Promise<boolean> {
+  if (!isDiscordChannel(event.channel) || isLikelyInboundTextCommand(event.content)) {
+    return false;
+  }
+  const scope = scopeFromInboundClaim(event);
+  if (!scope) {
+    return false;
+  }
+  const runtimeConfig = (api.runtime as { config?: { current?: () => unknown } }).config?.current?.();
+  const policyConfig = extraPolicyPluginConfig(runtimeConfig ?? api.config);
+  if (policyConfig?.enabled === false) {
+    return false;
+  }
+  const state = await loadExtraPolicyState(extraPolicyStatePath(api, policyConfig));
+  const policy = findRuntimePolicyForScope(state, scope);
+  if (!policy) {
+    return false;
+  }
+  const responseMode = normalizeResponseMode(policy.responseMode);
+  const suppress = shouldSuppressForRuntimeResponseMode(responseMode, event);
+  if (suppress) {
+    api.logger.debug?.(
+      `codex inbound claim silenced by extra-message-policy scope=${runtimeScopeKey(scope, scope.conversationId || scope.channelId)} response=${responseMode}`,
+    );
+  }
+  return suppress;
 }
 
 function asStringArray(value: unknown): string[] {
@@ -2695,17 +2987,7 @@ export class CodexPluginController {
     };
   }
 
-  async handleInboundClaim(event: {
-    content: string;
-    channel: string;
-    accountId?: string;
-    conversationId?: string;
-    parentConversationId?: string;
-    threadId?: string | number;
-    isGroup?: boolean;
-    media?: PluginInboundMedia[];
-    metadata?: Record<string, unknown>;
-  }): Promise<{ handled: boolean }> {
+  async handleInboundClaim(event: InboundClaimEvent): Promise<{ handled: boolean }> {
     try {
       this.refreshSettingsFromRuntime();
       if (!this.settings.enabled) {
@@ -2713,6 +2995,9 @@ export class CodexPluginController {
       }
       if (!this.settings.inboundClaim.enabled) {
         return { handled: false };
+      }
+      if (await shouldSilenceInboundClaimForExtraMessagePolicy(this.api, event)) {
+        return { handled: true };
       }
       await this.start();
       const inboundConversation = toConversationTargetFromInbound(event);

@@ -4,3 +4,10 @@ node_modules/
 *.tgz
 __pycache__/
 *.pyc
+
+# syncwheel managed metadata
+.syncwheel/ledger/
+.syncwheel/profile.local.json
+.syncwheel/manifests/*.local.json
+var/syncwheel/
+# end syncwheel managed metadata

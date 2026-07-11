@@ -50,6 +50,19 @@ function makeStateDir(): string {
   return fs.mkdtempSync(path.join(os.tmpdir(), "openclaw-app-server-test-"));
 }
 
+function writeExtraMessagePolicyState(
+  stateDir: string,
+  scopes: Record<string, { policy: { responseMode: string; ingestMode?: string } }>,
+): void {
+  const policyDir = path.join(stateDir, "extra-message-policy");
+  fs.mkdirSync(policyDir, { recursive: true });
+  fs.writeFileSync(
+    path.join(policyDir, "policy-state.json"),
+    JSON.stringify({ version: 1, scopes }, null, 2),
+    "utf8",
+  );
+}
+
 function createApiMock(pluginConfigOverrides: Record<string, unknown> = {}) {
   const stateDir = makeStateDir();
   const sendComponentMessage = vi.fn(async (..._args: unknown[]) => ({ messageId: "discord-component-1", channelId: "channel:chan-1" }));
@@ -4211,6 +4224,133 @@ describe("Discord controller flows", () => {
     );
     expect(clearComponents).not.toHaveBeenCalled();
     expect(reply).not.toHaveBeenCalled();
+  });
+
+  it("silences Discord inbound claims when extra-message-policy parent scope requires mention", async () => {
+    const { controller, discordTypingStart, stateDir } = await createControllerHarness();
+    writeExtraMessagePolicyState(stateDir, {
+      "discord:default:guild-1:parent-1": { policy: { responseMode: "mention", ingestMode: "off" } },
+    });
+    await (controller as any).store.upsertBinding({
+      conversation: {
+        channel: "discord",
+        accountId: "default",
+        conversationId: "channel:thread-2",
+        parentConversationId: "channel:parent-1",
+        threadId: "thread-2",
+      },
+      sessionKey: "session-2",
+      threadId: "codex-thread-2",
+      workspaceDir: "/repo/openclaw",
+      updatedAt: Date.now(),
+    });
+    const startTurn = vi.fn(() => ({
+      result: Promise.resolve({ threadId: "codex-thread-2", text: "hello" }),
+      getThreadId: () => "codex-thread-2",
+      queueMessage: vi.fn(async () => true),
+    }));
+    (controller as any).client.startTurn = startTurn;
+
+    const result = await controller.handleInboundClaim({
+      content: "message in mention-only thread",
+      channel: "discord",
+      accountId: "default",
+      conversationId: "parent-1",
+      parentConversationId: "parent-1",
+      threadId: "thread-2",
+      isGroup: true,
+      metadata: { guildId: "guild-1" },
+    });
+
+    expect(result).toEqual({ handled: true });
+    expect(startTurn).not.toHaveBeenCalled();
+    expect(discordTypingStart).not.toHaveBeenCalled();
+  });
+
+  it("allows Discord inbound claims when extra-message-policy mention mode is satisfied", async () => {
+    const { controller, discordTypingStart, stateDir } = await createControllerHarness();
+    writeExtraMessagePolicyState(stateDir, {
+      "discord:default:guild-1:parent-1": { policy: { responseMode: "mention", ingestMode: "off" } },
+    });
+    await (controller as any).store.upsertBinding({
+      conversation: {
+        channel: "discord",
+        accountId: "default",
+        conversationId: "channel:thread-2",
+        parentConversationId: "channel:parent-1",
+        threadId: "thread-2",
+      },
+      sessionKey: "session-2",
+      threadId: "codex-thread-2",
+      workspaceDir: "/repo/openclaw",
+      updatedAt: Date.now(),
+    });
+    const startTurn = vi.fn(() => ({
+      result: Promise.resolve({ threadId: "codex-thread-2", text: "hello" }),
+      getThreadId: () => "codex-thread-2",
+      queueMessage: vi.fn(async () => true),
+    }));
+    (controller as any).client.startTurn = startTurn;
+
+    const result = await controller.handleInboundClaim({
+      content: "<@123> message in mention-only thread",
+      channel: "discord",
+      accountId: "default",
+      conversationId: "parent-1",
+      parentConversationId: "parent-1",
+      threadId: "thread-2",
+      isGroup: true,
+      metadata: { guildId: "guild-1", wasMentioned: true },
+    });
+
+    expect(result).toEqual({ handled: true });
+    expect(startTurn).toHaveBeenCalled();
+    expect(discordTypingStart).toHaveBeenCalledWith(
+      expect.objectContaining({ channelId: "thread-2", accountId: "default" }),
+    );
+  });
+
+  it("allows Discord inbound claims when extra-message-policy parent scope is always", async () => {
+    const { controller, discordTypingStart, stateDir } = await createControllerHarness();
+    writeExtraMessagePolicyState(stateDir, {
+      "discord:default:guild-1:parent-1": { policy: { responseMode: "always", ingestMode: "off" } },
+    });
+    await (controller as any).store.upsertBinding({
+      conversation: {
+        channel: "discord",
+        accountId: "default",
+        conversationId: "channel:thread-2",
+        parentConversationId: "channel:parent-1",
+        threadId: "thread-2",
+      },
+      sessionKey: "session-2",
+      threadId: "codex-thread-2",
+      workspaceDir: "/repo/openclaw",
+      updatedAt: Date.now(),
+    });
+    const startTurn = vi.fn(() => ({
+      result: Promise.resolve({ threadId: "codex-thread-2", text: "hello" }),
+      getThreadId: () => "codex-thread-2",
+      queueMessage: vi.fn(async () => true),
+    }));
+    (controller as any).client.startTurn = startTurn;
+
+    const result = await controller.handleInboundClaim({
+      content: "message in always thread",
+      channel: "discord",
+      accountId: "default",
+      conversationId: "parent-1",
+      parentConversationId: "parent-1",
+      threadId: "thread-2",
+      isGroup: true,
+      metadata: { guildId: "guild-1" },
+    });
+
+    expect(result).toEqual({ handled: true });
+    expect(startTurn).toHaveBeenCalled();
+    expect(discordTypingStart).toHaveBeenCalledWith(
+      expect.objectContaining({ channelId: "thread-2", accountId: "default" }),
+    );
   });
 
   it("claims inbound Discord messages for raw thread ids after a typed bind", async () => {
